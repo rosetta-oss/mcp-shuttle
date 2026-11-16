@@ -61,6 +61,61 @@
       [:post "/mcp/messages"] (transport/handle-messages deps request)
       nil)))
 
+(def data-methods
+  "What the data profile answers: the handshake and tools, nothing else."
+  #{"initialize" "notifications/initialized" "ping" "tools/list" "tools/call"})
+
+(defn data-routes
+  "Ring handler for the **data profile**: MCP for programs (other services,
+   batch jobs) rather than for people and their agents. One route, `POST` at
+   `:path` (default \"/mcp/data\"); `GET` there answers 405. Compared with
+   `routes`:
+   - no HTTP+SSE transport and never a session: every request stands alone;
+   - tools only: resources, prompts and instructions are not announced, and
+     their methods are -32601;
+   - limits are required: `:rate-limit?` and `:max-body-bytes` must be given
+     (`rate-limiter` makes the first);
+   - every failure a program can meet carries a stable code in its JSON text:
+     `invalid_arguments`, `unknown_tool`, `timeout`, `internal_error` (with a
+     `reference`), or the tool's own `:code` on a refusal.
+   Build the tools with `shuttle.tools/data-deps`, which insists on an
+   `:output` schema and a `:timeout-ms` for every tool.
+
+   Same deps as `routes` otherwise. Returns nil for any other request."
+  [deps]
+  (doseq [k [:rate-limit? :max-body-bytes]]
+    (when (nil? (get deps k))
+      (throw (ex-info (str "data-routes needs " k) {:missing k}))))
+  (let [path (or (:path deps) "/mcp/data")
+        deps (-> deps
+                 (dissoc :resources-list :resource-read :prompts-list :prompt-get :instructions)
+                 (assoc :profile :data :methods data-methods))]
+    (fn [{:keys [request-method uri] :as request}]
+      (when (= uri path)
+        (case request-method
+          :post (transport/handle-post deps request)
+          (transport/handle-get request))))))
+
+(defn rate-limiter
+  "A `:rate-limit?` for one process: at most `n` requests per caller id in any
+   `per-ms` window (a sliding window kept per id). Several instances behind a
+   balancer each count on their own; a shared limit needs the host's own
+   function."
+  [n per-ms]
+  (let [seen (atom {})]
+    (fn [id]
+      (let [now (System/currentTimeMillis)
+            since (- now per-ms)
+            [old] (swap-vals! seen update id
+                              (fn [ts]
+                                (let [ts (filterv #(> % since) ts)]
+                                  (if (< (count ts) n) (conj ts now) ts))))
+            before (filterv #(> % since) (get old id))]
+        (if (< (count before) n)
+          {:allowed? true}
+          {:allowed? false
+           :retry-after-secs (max 1 (long (Math/ceil (/ (- (+ (first before) per-ms) now) 1000.0))))})))))
+
 (defn bearer
   "The request's Bearer credential, or nil.
 

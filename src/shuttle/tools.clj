@@ -27,7 +27,9 @@
    - `:output` becomes `outputSchema`; a map result is then also sent as
      `structuredContent`. A result that does not fit is a server fault: the
      tool broke its own promise.
-   - A handler refuses by returning `{:error …}`; it fails by throwing.
+   - A handler refuses by returning `{:error …}` (add `:code` for programs to
+     branch on); it fails by throwing. The library's own refusals carry
+     `:code` too: `invalid_arguments`, `unknown_tool`, `timeout`.
    - `:timeout-ms`: a handler still running then is abandoned and the call is
      a refusal saying so.
    - `:visible?` filters per caller; `tools/list` and `tools/call` use the
@@ -81,11 +83,11 @@
 (defn- call [t ctx args]
   (let [args (if-let [dec (::decode t)] (dec args) args)]
     (if (and (::valid-in? t) (not ((::valid-in? t) args)))
-      {:error "invalid arguments" :details (me/humanize (m/explain (::in t) args))}
+      {:error "invalid arguments" :code "invalid_arguments" :details (me/humanize (m/explain (::in t) args))}
       (let [run #((:handler t) ctx args)
             result (if-let [ms (:timeout-ms t)] (run-with-timeout ms run) (run))]
         (cond
-          (= ::timed-out result) {:error (str "the tool did not finish within " (:timeout-ms t) " ms")}
+          (= ::timed-out result) {:error (str "the tool did not finish within " (:timeout-ms t) " ms") :code "timeout"}
           (and (map? result) (contains? result :error)) result
           (::valid-out? t)
           (if ((::valid-out? t) result)
@@ -109,4 +111,17 @@
      :call-tool (fn [ctx tool args]
                   (if-let [t (some #(when (= tool (:name %)) %) (visible ctx))]
                     (call t ctx args)
-                    {:error (str "unknown tool: " tool)}))}))
+                    {:error (str "unknown tool: " tool) :code "unknown_tool"}))}))
+
+(defn data-deps
+  "`deps` for `shuttle.http/data-routes`: the same, but every tool must have an
+   `:output` schema (a program reads the result, so its shape is a contract)
+   and a `:timeout-ms` (a program must know how long it may wait). Per-caller
+   definition functions are checked on each call."
+  [defs]
+  (let [check (fn [ts]
+                (doseq [t ts]
+                  (when-not (:output t) (throw (ex-info (str "data tool " (:name t) " needs :output") {})))
+                  (when-not (pos-int? (:timeout-ms t)) (throw (ex-info (str "data tool " (:name t) " needs :timeout-ms") {}))))
+                ts)]
+    (deps (if (fn? defs) (comp check defs) (check defs)))))

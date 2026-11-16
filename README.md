@@ -4,7 +4,7 @@ MCP ([Model Context Protocol](https://modelcontextprotocol.io/)) server and clie
 handler; the client uses the JDK's HttpClient.
 
 Status: early. Server (HTTP transport, protocol core, tools with malli schemas) and client work and
-are tested; the `data` profile, sessions for server push, and protocol 2025-11-25 are next.
+are tested, in two profiles; sessions for server push and protocol 2025-11-25 are next.
 
 ## Layers
 
@@ -56,6 +56,19 @@ are tested; the `data` profile, sessions for server push, and protocol 2025-11-2
 `routes` returns nil for any other path, so it composes with a host's own routes. See the docstrings
 of `shuttle.http` and `shuttle.tools` for every injected function and tool option. A tool refuses by
 returning `{:error …}` (sent to the agent as JSON) and fails by throwing.
+
+## Two profiles
+
+| | `routes` (build) | `data-routes` (data) |
+|---|---|---|
+| For | people and their agents (Claude Code, agent builders) | programs: other services, batch jobs |
+| Path | `/mcp` (+ `/mcp/sse`, `/mcp/messages`) | `/mcp/data`, POST only |
+| Offers | tools, resources, prompts, instructions | tools only |
+| Limits | optional | `:rate-limit?` and `:max-body-bytes` required (`mcp/rate-limiter`) |
+| Tools | `tools/deps` | `tools/data-deps`: every tool needs `:output` and `:timeout-ms` |
+| Failures | readable text | JSON with a stable `code`: `invalid_arguments`, `unknown_tool`, `timeout`, `internal_error` (+ `reference`), or the tool's own |
+
+A host can mount both, with different tool sets and limits.
 
 ## Client
 

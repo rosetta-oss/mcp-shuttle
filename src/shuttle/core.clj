@@ -11,7 +11,9 @@
    The host's judgement arrives in the same deps map the transport takes:
    `:tools-list`, `:call-tool`, `:server-info`, `:instructions`,
    `:resources-list` / `:resource-read`, `:prompts-list` / `:prompt-get`,
-   `:on-fault` (see `shuttle.http`). `shuttle.tools` builds `:tools-list` and
+   `:on-fault` (see `shuttle.http`); `:methods`, when given, is the set of
+   methods answered (others are -32601), and `:profile :data` makes a fault's
+   text JSON with a stable code (see `shuttle.http/data-routes`). `shuttle.tools` builds `:tools-list` and
    `:call-tool` from tool definitions with malli schemas."
   (:require [shuttle.impl.jsonrpc :as rpc])
   (:import [java.util UUID]))
@@ -132,10 +134,13 @@
                    (let [reference (subs (str (UUID/randomUUID)) 0 8)]
                      (try ((or (:on-fault deps) log-fault!) reference e name)
                           (catch Throwable _ nil))
-                     {:error (fault-message reference) :fault true})))]
+                     {:error (fault-message reference) :fault true :reference reference})))]
     (if (:error result)
       (rpc/tool-error id (if (:fault result)
-                           (:error result)
+                           (if (= :data (:profile deps))
+                             (rpc/json-text {:error "internal error" :code "internal_error"
+                                             :reference (:reference result)})
+                             (:error result))
                            ;; A refusal is an answer: hand the agent the whole
                            ;; structured finding, because "which key was wrong"
                            ;; is exactly what it needs to fix the next call.
@@ -151,6 +156,8 @@
     (rpc/error id -32601 (str "Method not found: " method))))
 
 (defn- dispatch-method [deps {:keys [method params id]} ctx version]
+  (if (and (:methods deps) (not (contains? (:methods deps) method)))
+    (when id (rpc/error id -32601 (str "Method not found: " method)))
   (case method
     "initialize"                (handle-initialize deps id params ctx)
     "notifications/initialized" nil
@@ -177,7 +184,7 @@
                                                     (if (:error r)
                                                       (rpc/error id -32602 (:error r))
                                                       (rpc/success id r))))
-    (rpc/error id -32601 (str "Method not found: " method))))
+    (rpc/error id -32601 (str "Method not found: " method)))))
 
 (defn handle
   "Handles one decoded JSON-RPC message (a batch element, or the whole body of
