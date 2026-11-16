@@ -440,6 +440,9 @@
         ;; make the gate pass by reading zero files.
         paths ["shuttle/http.clj"
                "shuttle/json.clj"
+               "shuttle/core.clj"
+               "shuttle/tools.clj"
+               "shuttle/client.clj"
                "shuttle/impl/transport.clj"
                "shuttle/impl/jsonrpc.clj"]
         sources (for [p paths
@@ -462,5 +465,5 @@
       (is (empty? (for [[path text] sources
                         :let [req (re-find #"\(:require[\s\S]*?\)\)" text)]
                         ns (re-seq #"\[([a-z][\w.\-]*) " (or req ""))
-                        :when (not (re-matches #"(shuttle|clojure|java)\..*" (second ns)))]
+                        :when (not (re-matches #"(shuttle|clojure|java|malli)\..*" (second ns)))]
                     [path (second ns)]))))))

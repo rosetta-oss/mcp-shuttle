@@ -70,6 +70,7 @@
      Absent means no limiting, which is a visible config fact rather than a
      silent default."
   (:require [clojure.string :as str]
+            [shuttle.core :as core]
             [shuttle.impl.jsonrpc :as rpc])
   (:import [java.io IOException]
            [java.util UUID]
@@ -77,176 +78,6 @@
 
 (def ^:private header-authorization "authorization")
 (def ^:private bearer-prefix "Bearer ")
-
-;; ---------------------------------------------------------------------------
-;; JSON-RPC method dispatch
-;; ---------------------------------------------------------------------------
-
-(def ^:private supported-protocol-versions
-  "Protocol revisions this server can speak. Preferred first — a client asking
-   for a version we don't know gets the preferred one back (spec: 'the server
-   MUST respond with another protocol version it supports')."
-  ["2025-03-26" "2025-06-18" "2024-11-05"])
-
-(defn- negotiate-protocol-version [requested]
-  (if (some #(= % requested) supported-protocol-versions)
-    requested
-    (first supported-protocol-versions)))
-
-;; ---------------------------------------------------------------------------
-;; Which protocol revision a message is read under
-;;
-;; Tool annotations arrived in 2025-03-26; a tool's `title`, `outputSchema`,
-;; a result's `structuredContent` and `serverInfo.title` in 2025-06-18. A host
-;; describes its tools in the NEWEST shape and this namespace removes what the
-;; caller's revision does not define — one judgement, made where versions are
-;; negotiated, instead of one per host.
-;;
-;; Streamable HTTP keeps no session here, so the revision of a POST is its
-;; `MCP-Protocol-Version` header (2025-06-18 makes clients send it after
-;; `initialize`). Absent or unknown, the spec says to assume 2025-03-26 — which
-;; is also exactly what every client that predates the header expects. The SSE
-;; leg has a session, and remembers what its `initialize` negotiated.
-;; ---------------------------------------------------------------------------
-
-(def ^:private assumed-protocol-version
-  "Spec 2025-06-18, Basic › Transports: without the header, assume 2025-03-26."
-  "2025-03-26")
-
-(defn- at-least? [version floor] (not (neg? (compare (str version) floor))))
-
-(defn- header-protocol-version [request]
-  (let [h (get-in request [:headers "mcp-protocol-version"])]
-    (when (some #(= % h) supported-protocol-versions) h)))
-
-(defn- shape-tool
-  "One `tools/list` entry, without the fields `version` does not define."
-  [version tool]
-  (cond
-    (at-least? version "2025-06-18") tool
-    (at-least? version "2025-03-26") (dissoc tool "title" :title "outputSchema" :outputSchema)
-    :else (dissoc tool "title" :title "outputSchema" :outputSchema "annotations" :annotations)))
-
-(defn- structured-content
-  "The result again as `structuredContent`, when the host marked it (toolkit
-   `structured-content-key`, by name) and the revision defines the field. The
-   text block stays: a client that ignores structured content reads the same
-   JSON there (2025-06-18: a tool returning structured content SHOULD also
-   return it serialized as text)."
-  [version result]
-  (when (and (at-least? version "2025-06-18") (map? result)
-             (get (meta result) :mcp/structured-content))
-    result))
-
-(defn- resolve-per-ctx
-  "A dep that may be a value or `(fn [ctx])` (a host may let
-   the handshake describe whatever the caller's credential names)."
-  [x ctx]
-  (if (fn? x) (x ctx) x))
-
-(defn- handle-initialize [deps id params ctx]
-  (let [version (negotiate-protocol-version (:protocolVersion params))
-        info (resolve-per-ctx (:server-info deps) ctx)
-        instructions (resolve-per-ctx (:instructions deps) ctx)]
-    (rpc/success id
-                 (cond-> {:protocolVersion version
-                          :capabilities (cond-> {:tools {:listChanged false}}
-                                          ;; Announced only by a host that
-                                          ;; serves them.
-                                          (:resources-list deps)
-                                          (assoc :resources {:subscribe false :listChanged false})
-                                          (:prompts-list deps)
-                                          (assoc :prompts {:listChanged false}))
-                          :serverInfo (if (at-least? version "2025-06-18")
-                                        info
-                                        (dissoc info :title "title"))}
-                   ;; Absent instructions stay absent rather than becoming an
-                   ;; empty string: a client can tell "this server has nothing to
-                   ;; say" from "this server says nothing", and the two differ.
-                   instructions (assoc :instructions instructions)))))
-
-(defn- log-fault! [reference ^Throwable e tool-name]
-  (.log ^java.lang.System$Logger (System/getLogger "shuttle")
-        java.lang.System$Logger$Level/ERROR
-        ^String (str "MCP tool " tool-name " failed; reference " reference)
-        e))
-
-(defn fault-message
-  "What the CLIENT is told about a thrown exception: nothing from the
-   exception itself, only a reference to quote."
-  [reference]
-  (str "the tool failed with an internal server error (reference " reference
-       "); the server log has the details under that reference"))
-
-(defn- handle-tools-call [deps id params ctx version]
-  (let [{:keys [name arguments]} params
-        result (try
-                 ((:call-tool deps) ctx name (or arguments {}))
-                 (catch Exception e
-                   ;; A thrown exception is a SERVER fault, not an answer.
-                   ;; Refusals travel as {:error …} data below. Its message is
-                   ;; NOT forwarded: a JDBC/SQL text can name hosts, schemas,
-                   ;; paths or values. Log in full, return a
-                   ;; reference.
-                   (let [reference (subs (str (UUID/randomUUID)) 0 8)]
-                     (try ((or (:on-fault deps) log-fault!) reference e name)
-                          (catch Throwable _ nil))
-                     {:error (fault-message reference) :fault true})))]
-    (if (:error result)
-      (rpc/tool-error id (if (:fault result)
-                           (:error result)
-                           ;; A refusal is an answer: hand the agent the whole
-                           ;; structured finding, because "which key was wrong"
-                           ;; is exactly what it needs to fix the next call.
-                           (pr-str (dissoc result :fault))))
-      (rpc/tool-content id result (structured-content version result)))))
-
-(defn- optional-method
-  "A method the host may not serve: -32601, exactly as an unknown method,
-   when the dep is absent."
-  [deps k id method f]
-  (if-let [g (get deps k)]
-    (f g)
-    (rpc/error id -32601 (str "Method not found: " method))))
-
-(defn- dispatch-method [deps {:keys [method params id]} ctx version]
-  (case method
-    "initialize"                (handle-initialize deps id params ctx)
-    "notifications/initialized" nil
-    "ping"                      (rpc/success id {})
-    "tools/list"                (rpc/success id {:tools (mapv #(shape-tool version %)
-                                                              ((:tools-list deps) ctx))})
-    "tools/call"                (handle-tools-call deps id params ctx version)
-    ;; Resources and prompts: optional, read-only, and
-    ;; computed from the same ctx as the tools, so a caller is offered exactly
-    ;; what its credential reaches. Spec: an unknown resource is -32002, a
-    ;; bad prompt name or argument -32602.
-    "resources/list"            (optional-method deps :resources-list id method
-                                                 #(rpc/success id {:resources (vec (% ctx))}))
-    "resources/templates/list"  (optional-method deps :resources-list id method
-                                                 (fn [_] (rpc/success id {:resourceTemplates []})))
-    "resources/read"            (optional-method deps :resource-read id method
-                                                 #(if-let [r (% ctx (:uri params))]
-                                                    (rpc/success id r)
-                                                    (rpc/error id -32002 "Resource not found")))
-    "prompts/list"              (optional-method deps :prompts-list id method
-                                                 #(rpc/success id {:prompts (vec (% ctx))}))
-    "prompts/get"               (optional-method deps :prompt-get id method
-                                                 #(let [r (% ctx (:name params) (or (:arguments params) {}))]
-                                                    (if (:error r)
-                                                      (rpc/error id -32602 (:error r))
-                                                      (rpc/success id r))))
-    (rpc/error id -32601 (str "Method not found: " method))))
-
-(defn- dispatch-element
-  "Dispatch one decoded JSON-RPC message (a batch element, or the whole body of
-   a non-batch request). Returns the response body string, or nil when there is
-   no reply — a notification. A non-Request object gets an -32600 Invalid
-   Request echoing its :id when present."
-  [deps decoded ctx version]
-  (if-let [parsed (rpc/as-request decoded)]
-    (dispatch-method deps parsed ctx version)
-    (rpc/error (when (map? decoded) (:id decoded)) -32600 "Invalid Request")))
 
 ;; ---------------------------------------------------------------------------
 ;; Shared request gates
@@ -345,7 +176,7 @@
 (defn- handle-post* [deps request]
   (if-let [{:keys [id ctx]} (authenticate deps request)]
     (let [rl (allowed? deps id)
-          version (or (header-protocol-version request) assumed-protocol-version)]
+          version (or (core/supported-version (get-in request [:headers "mcp-protocol-version"])) core/assumed-protocol-version)]
       (if-not (:allowed? rl)
         (rate-limited (:retry-after-secs rl))
         (let [{:keys [text over]} (read-body deps request)
@@ -366,14 +197,14 @@
             (if (empty? decoded)
               {:status 400 :headers {"Content-Type" "application/json"}
                :body (rpc/error nil -32600 "Invalid Request")}
-              (let [responses (keep #(dispatch-element deps % ctx version) decoded)]
+              (let [responses (keep #(core/handle deps % ctx version) decoded)]
                 (if (seq responses)
                   {:status 200 :headers {"Content-Type" "application/json"}
                    :body (str "[" (str/join "," responses) "]")}
                   {:status 202})))
 
             :else
-            (if-let [response (dispatch-element deps decoded ctx version)]
+            (if-let [response (core/handle deps decoded ctx version)]
               {:status 200 :headers {"Content-Type" "application/json"} :body response}
               ;; Notification — no response needed
               {:status 202})))))
@@ -516,9 +347,9 @@
 
                   :else
                   (let [session-version (get-in @sse-sessions [sid :protocol])
-                        version (or (header-protocol-version request) session-version
-                                    assumed-protocol-version)
-                        response (dispatch-element deps decoded ctx version)]
+                        version (or (core/supported-version (get-in request [:headers "mcp-protocol-version"])) session-version
+                                    core/assumed-protocol-version)
+                        response (core/handle deps decoded ctx version)]
                     ;; The SSE leg HAS a session: remember what its
                     ;; `initialize` settled, so later messages on it are read
                     ;; under that revision even without the header.
@@ -526,7 +357,7 @@
                       (swap! sse-sessions
                              (fn [m] (if (contains? m sid)
                                        (assoc-in m [sid :protocol]
-                                                 (negotiate-protocol-version
+                                                 (core/negotiate-protocol-version
                                                   (get-in decoded [:params :protocolVersion])))
                                        m))))
                     (if (or (nil? response) (push-sse-response! sid id response))

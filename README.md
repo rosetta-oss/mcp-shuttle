@@ -3,8 +3,17 @@
 MCP ([Model Context Protocol](https://modelcontextprotocol.io/)) server and client for Clojure. The server is a plain Ring
 handler; the client uses the JDK's HttpClient.
 
-Status: early. The HTTP server side and the client work and are tested; the protocol core, tool
-definitions with malli schemas and the `data` profile are next.
+Status: early. Server (HTTP transport, protocol core, tools with malli schemas) and client work and
+are tested; the `data` profile, sessions for server push, and protocol 2025-11-25 are next.
+
+## Layers
+
+| Namespace | What |
+|---|---|
+| `shuttle.core` | The protocol without a transport: a decoded JSON-RPC message, the caller's context and the revision in; the JSON reply out. |
+| `shuttle.tools` | Tools as data with malli schemas: announced as JSON Schema, arguments decoded and checked before the handler runs, optional output schema and `structuredContent`, per-tool timeout, per-caller visibility. |
+| `shuttle.http` | Ring handler: Streamable HTTP and HTTP+SSE, authentication, rate limit, body limit, Origin check, batches. |
+| `shuttle.client` | Client over Streamable HTTP. |
 
 ## What it does
 
@@ -23,23 +32,30 @@ definitions with malli schemas and the `data` profile are next.
 ## Use
 
 ```clojure
-(require '[shuttle.http :as mcp])
+(require '[shuttle.http :as mcp] '[shuttle.tools :as tools])
+
+(def my-tools
+  [{:name "echo"
+    :description "Echoes its text"
+    :input [:map [:text :string]]
+    :output [:map [:said :string]]
+    :handler (fn [ctx {:keys [text]}] {:said text})}])
 
 (def handler
   (mcp/routes
-   {:authenticate (fn [request]
-                    (when-let [caller (lookup-key (mcp/bearer request))]
-                      {:id (:id caller) :ctx caller}))
-    :tools-list (fn [ctx] [{:name "echo" :description "Echoes its text"
-                            :inputSchema {:type "object" :properties {:text {:type "string"}}}}])
-    :call-tool (fn [ctx tool args] (case tool "echo" {:said (:text args)}))
-    :server-info {:name "my-service" :version "1.0.0"}
-    :unauthorized-message "Send your service key as a Bearer token."
-    :sse-writer (fn [write!] (ring-streaming-body write!))}))
+   (merge
+    (tools/deps my-tools)          ; :tools-list and :call-tool
+    {:authenticate (fn [request]
+                     (when-let [caller (lookup-key (mcp/bearer request))]
+                       {:id (:id caller) :ctx caller}))
+     :server-info {:name "my-service" :version "1.0.0"}
+     :unauthorized-message "Send your service key as a Bearer token."
+     :sse-writer (fn [write!] (ring-streaming-body write!))})))
 ```
 
 `routes` returns nil for any other path, so it composes with a host's own routes. See the docstrings
-of `shuttle.http` for every injected function.
+of `shuttle.http` and `shuttle.tools` for every injected function and tool option. A tool refuses by
+returning `{:error …}` (sent to the agent as JSON) and fails by throwing.
 
 ## Client
 

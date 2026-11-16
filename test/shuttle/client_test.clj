@@ -78,8 +78,8 @@
     (testing "a refusal is isError → exception with the tool's text"
       (let [e (is (thrown? clojure.lang.ExceptionInfo
                            (client/call-tool {:url url :bearer "k" :label "Svc"} "nope" {})))]
-        ;; the server sends a refusal's whole map as the text
-        (is (= "Svc nope: {:error \"no tool nope\"}" (ex-message e)))
+        ;; the server sends a refusal's whole map, as JSON, as the text
+        (is (= "Svc nope: {\"error\":\"no tool nope\"}" (ex-message e)))
         (is (true? (get-in (ex-data e) [:result :isError])))))
     (testing "a fault reaches the client without its detail"
       (let [e (is (thrown? clojure.lang.ExceptionInfo (client/call-tool {:url url :bearer "k"} "boom" {})))]

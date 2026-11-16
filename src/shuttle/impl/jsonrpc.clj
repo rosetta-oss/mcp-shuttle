@@ -54,3 +54,8 @@
   "MCP tools/call error result (isError true)."
   [id message]
   (success id {:content [{:type "text" :text message}] :isError true}))
+
+(defn json-text
+  "A value as JSON text, for a tool result's text block."
+  [x]
+  (json/write x))
