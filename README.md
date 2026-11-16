@@ -1,9 +1,10 @@
 # mcp-shuttle
 
-MCP ([Model Context Protocol](https://modelcontextprotocol.io/)) server for Clojure, as a plain Ring handler.
+MCP ([Model Context Protocol](https://modelcontextprotocol.io/)) server and client for Clojure. The server is a plain Ring
+handler; the client uses the JDK's HttpClient.
 
-Status: early. The HTTP server side works and is tested; the protocol core, tool definitions with
-malli schemas, the `data` profile and the client are next.
+Status: early. The HTTP server side and the client work and are tested; the protocol core, tool
+definitions with malli schemas and the `data` profile are next.
 
 ## What it does
 
@@ -39,6 +40,23 @@ malli schemas, the `data` profile and the client are next.
 
 `routes` returns nil for any other path, so it composes with a host's own routes. See the docstrings
 of `shuttle.http` for every injected function.
+
+## Client
+
+```clojure
+(require '[shuttle.client :as mcp-client])
+
+;; one call: initialize, call, close
+(mcp-client/call-tool {:url "http://host:port/mcp" :bearer key :timeout-ms 180000} "templates" {:limit 200})
+
+;; several calls
+(let [c (mcp-client/connect {:url "http://host:port/mcp" :bearer key})]
+  (try (mcp-client/list-tools c) (finally (mcp-client/close c))))
+```
+
+Every failure throws an `ex-info` (HTTP status, JSON-RPC error, `isError`, unreadable answer,
+timeout, no connection); nothing is printed and nothing silently returns nil. Event-stream answers
+and server sessions are handled, including initializing again once when a server forgets a session.
 
 ## Develop
 
