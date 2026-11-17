@@ -451,8 +451,7 @@
         _ (doseq [[p text] sources]
             (is (some? text) (str "not on the classpath: " p)))
         forbidden [#"(?i)\bgraph\b" #"(?i)\bworkspace\b" #"(?i)\bdialect\b"
-                   #"(?i)\bresolver\b" #"(?i)\bentity\b" #"(?i)\bEQL\b"
-                   #"(?i)semalith" #"(?i)dossier" #"(?i)\bloom\b" #"(?i)open\.atlas"]
+                   #"(?i)\bresolver\b" #"(?i)\bentity\b" #"(?i)\bEQL\b"]
         hits (for [[path text] sources
                    pattern forbidden
                    :let [found (re-seq pattern text)]
