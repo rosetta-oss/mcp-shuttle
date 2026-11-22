@@ -51,7 +51,8 @@
    definitions, for tool sets that differ per caller or change while running.
    What a schema compiles to is kept by the schema's value, so definitions
    built anew on every call cost a lookup, not a compilation."
-  (:require [malli.core :as m]
+  (:require [clojure.string :as str]
+            [malli.core :as m]
             [malli.error :as me]
             [malli.json-schema :as mjs]
             [malli.transform :as mt]
@@ -151,11 +152,30 @@
            ::timed-out)
          (catch ExecutionException e (throw (or (.getCause e) e))))))
 
+(defn- argument-message
+  "What is wrong with the arguments, in one sentence a person or an agent can
+   act on: the names not known, what is wrong with the others, the names the
+   tool takes."
+  [details accepts]
+  (let [label #(if (keyword? %) (subs (str %) 1) (str %))
+        entries (when (map? details) details)
+        unknown (for [[k v] entries :when (= ["disallowed key"] v)] (label k))
+        wrong (for [[k v] entries :when (not= ["disallowed key"] v)]
+                (str (label k) " " (if (and (sequential? v) (every? string? v)) (str/join ", " v) (pr-str v))))]
+    (str "invalid arguments"
+         (when (or (seq unknown) (seq wrong) (not entries)) ": ")
+         (str/join "; " (concat (when (seq unknown) [(str "unknown " (str/join ", " unknown))])
+                                wrong
+                                (when-not entries [(pr-str details)])))
+         (when (seq accepts) (str "; the tool takes " (str/join ", " accepts))))))
+
 (defn- call [t ctx args]
   (let [args (if-let [dec (::decode t)] (dec args) args)]
     (if (and (::valid-in? t) (not ((::valid-in? t) args)))
-      (refuse "invalid arguments" (cond-> {:code "invalid_arguments" :details (me/humanize (m/explain (::in t) args))}
-                                    (::accepts t) (assoc :accepts (::accepts t))))
+      (let [details (me/humanize (m/explain (::in t) args))]
+        (refuse (argument-message details (::accepts t))
+                (cond-> {:code "invalid_arguments" :details details}
+                  (::accepts t) (assoc :accepts (::accepts t)))))
       (let [run #((:handler t) ctx args)
             result (if-let [ms (:timeout-ms t)]
                      (run-with-timeout ms run (when-let [f (:on-timeout t)] #(f ctx args)))

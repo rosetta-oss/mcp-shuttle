@@ -5,6 +5,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-22
+
+### Changed
+- `shuttle.tools`: an `invalid_arguments` refusal's `:error` says what is wrong in one sentence
+  (`invalid arguments: unknown limt; n should be an integer; the tool takes limit, n`) instead of only
+  `invalid arguments`. `:code`, `:details` and `:accepts` are unchanged.
+
 ## [0.3.0] - 2026-11-22
 
 ### Added
@@ -99,7 +106,8 @@ First release.
   event-stream answers; session re-initialize on 404.
 - `shuttle.json`: keywords keep their namespace when written.
 
-[Unreleased]: https://github.com/rosetta-oss/mcp-shuttle/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/rosetta-oss/mcp-shuttle/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/rosetta-oss/mcp-shuttle/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/rosetta-oss/mcp-shuttle/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rosetta-oss/mcp-shuttle/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/rosetta-oss/mcp-shuttle/compare/v0.1.0...v0.1.1

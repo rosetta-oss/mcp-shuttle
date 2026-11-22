@@ -73,7 +73,7 @@
     (let [r (call "add" {:a "two"})
           body (json/read (get-in r [:content 0 :text]))]
       (is (true? (:isError r)))
-      (is (= "invalid arguments" (:error body)))
+      (is (= "invalid arguments: a should be an integer; the tool takes a, b" (:error body)))
       (is (contains? (:details body) :a))))
   (testing "missing required field"
     (is (true? (:isError (call "add" {})))))
@@ -129,7 +129,8 @@
         (is (true? (:isError r)))
         (is (= "invalid_arguments" (:code body)))
         (is (contains? (:details body) :limt))
-        (is (= ["limit"] (:accepts body)))))
+        (is (= ["limit"] (:accepts body)))
+        (is (= "invalid arguments: unknown limt; the tool takes limit" (:error body)))))
     (testing "and the announced schema says so"
       (is (false? (get-in (first ((:tools-list (d t)) {})) [:inputSchema :additionalProperties]))))
     (testing ":extra-args :allow lets them through"
