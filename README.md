@@ -11,7 +11,7 @@ are tested, in two profiles; sessions for server push and protocol 2025-11-25 ar
 `deps.edn`, as a git dependency (the SHA is the tag's commit, listed on the release page):
 
 ```clojure
-io.github.rosetta-oss/mcp-shuttle {:git/tag "v0.1.1" :git/sha "c424d88"}
+io.github.rosetta-oss/mcp-shuttle {:git/tag "v0.2.0" :git/sha "368f4fe"}
 ```
 
 Needs Java 21 or later. Changes are in [CHANGELOG.md](CHANGELOG.md).
