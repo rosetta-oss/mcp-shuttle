@@ -23,13 +23,14 @@
 ;; ---------------------------------------------------------------------------
 
 (def supported-protocol-versions
-  "Protocol revisions this server can speak. Preferred first — a client asking
-   for a version we don't know gets the preferred one back (spec: 'the server
-   MUST respond with another protocol version it supports')."
-  ["2025-03-26" "2025-06-18" "2024-11-05"])
+  "Protocol revisions this server can speak, newest first. A client asking for
+   a revision not listed gets the newest one back (spec: 'the server MUST
+   respond with another protocol version it supports. This SHOULD be the latest
+   version supported by the server')."
+  ["2025-06-18" "2025-03-26" "2024-11-05"])
 
 (defn negotiate-protocol-version
-  "The revision `initialize` answers with: the requested one when supported, else the preferred one."
+  "The revision `initialize` answers with: the requested one when supported, else the newest one."
   [requested]
   (if (some #(= % requested) supported-protocol-versions)
     requested
@@ -108,11 +109,34 @@
                    ;; say" from "this server says nothing", and the two differ.
                    instructions (assoc :instructions instructions)))))
 
-(defn- log-fault! [reference ^Throwable e tool-name]
+(defn- log-fault! [reference ^Throwable e what]
   (.log ^java.lang.System$Logger (System/getLogger "shuttle")
         java.lang.System$Logger$Level/ERROR
-        ^String (str "MCP tool " tool-name " failed; reference " reference)
+        ^String (str "MCP " what " failed; reference " reference)
         e))
+
+(defn fatal?
+  "A Throwable the JVM cannot go on from (out of memory and the like): it is
+   rethrown, never turned into an answer. A StackOverflowError is not one: the
+   stack has unwound by the time it is caught."
+  [^Throwable t]
+  (and (instance? VirtualMachineError t) (not (instance? StackOverflowError t))))
+
+(defn report-fault!
+  "Hands a Throwable to the host's `:on-fault` (or the JDK logger) under a new
+   reference, and returns the reference: the only thing a client is told.
+   `what` is the tool's name for a tool call, else the method, or \"http\" for
+   a failure outside any message (the host's authenticator, say)."
+  [deps ^Throwable t what]
+  (let [reference (subs (str (UUID/randomUUID)) 0 8)]
+    (try ((or (:on-fault deps) log-fault!) reference t what)
+         (catch Throwable _ nil))
+    reference))
+
+(defn internal-error-message
+  "What a client is told when anything but a tool call failed."
+  [reference]
+  (str "Internal error (reference " reference "); the server log has the details under that reference"))
 
 (defn fault-message
   "What the CLIENT is told about a thrown exception: nothing from the
@@ -121,31 +145,29 @@
   (str "the tool failed with an internal server error (reference " reference
        "); the server log has the details under that reference"))
 
-(defn- handle-tools-call [deps id params ctx version]
-  (let [{:keys [name arguments]} params
-        result (try
-                 ((:call-tool deps) ctx name (or arguments {}))
-                 (catch Exception e
-                   ;; A thrown exception is a SERVER fault, not an answer.
-                   ;; Refusals travel as {:error …} data below. Its message is
-                   ;; NOT forwarded: a JDBC/SQL text can name hosts, schemas,
-                   ;; paths or values. Log in full, return a
-                   ;; reference.
-                   (let [reference (subs (str (UUID/randomUUID)) 0 8)]
-                     (try ((or (:on-fault deps) log-fault!) reference e name)
-                          (catch Throwable _ nil))
-                     {:error (fault-message reference) :fault true :reference reference})))]
-    (if (:error result)
-      (rpc/tool-error id (if (:fault result)
-                           (if (= :data (:profile deps))
-                             (rpc/json-text {:error "internal error" :code "internal_error"
-                                             :reference (:reference result)})
-                             (:error result))
-                           ;; A refusal is an answer: hand the agent the whole
-                           ;; structured finding, because "which key was wrong"
-                           ;; is exactly what it needs to fix the next call.
-                           (rpc/json-text (dissoc result :fault))))
-      (rpc/tool-content id result (structured-content version result)))))
+(defn- handle-tools-call
+  "A thrown Throwable is a SERVER fault, not an answer (refusals travel as
+   `{:error …}` data). Its message is NOT forwarded: a JDBC/SQL text can name
+   hosts, schemas, paths or values. It is logged in full and the client gets a
+   reference. Writing the result as JSON is inside the same guard: a value
+   JSON cannot carry is the tool's fault too."
+  [deps id params ctx version]
+  (let [{:keys [name arguments]} params]
+    (try
+      (let [result ((:call-tool deps) ctx name (or arguments {}))]
+        (if (:error result)
+          ;; A refusal is an answer: hand the agent the whole structured
+          ;; finding, because "which key was wrong" is exactly what it needs
+          ;; to fix the next call.
+          (rpc/tool-error id (rpc/json-text result))
+          (rpc/tool-content id result (structured-content version result))))
+      (catch Throwable t
+        (when (fatal? t) (throw t))
+        (let [reference (report-fault! deps t name)]
+          (rpc/tool-error id (if (= :data (:profile deps))
+                               (rpc/json-text {:error "internal error" :code "internal_error"
+                                               :reference reference})
+                               (fault-message reference))))))))
 
 (defn- optional-method
   "A method the host may not serve: -32601, exactly as an unknown method,
@@ -157,7 +179,7 @@
 
 (defn- dispatch-method [deps {:keys [method params id]} ctx version]
   (if (and (:methods deps) (not (contains? (:methods deps) method)))
-    (when id (rpc/error id -32601 (str "Method not found: " method)))
+    (rpc/error id -32601 (str "Method not found: " method))
   (case method
     "initialize"                (handle-initialize deps id params ctx)
     "notifications/initialized" nil
@@ -186,13 +208,32 @@
                                                       (rpc/success id r))))
     (rpc/error id -32601 (str "Method not found: " method)))))
 
+(defn- response?
+  "A JSON-RPC response (to a request this server never sent, or a late one)."
+  [m]
+  (and (map? m) (not (contains? m :method)) (or (contains? m :result) (contains? m :error))))
+
 (defn handle
   "Handles one decoded JSON-RPC message (a batch element, or the whole body of
    a non-batch request) from an authenticated caller, read under `version`.
-   Returns the response as a JSON string, or nil when there is no reply (a
-   notification). A non-Request object gets an -32600 Invalid Request echoing
-   its :id when present."
+   Returns the response as a JSON string, or nil when there is no reply.
+
+   - A notification (no id) and a response are never answered, whatever they
+     say: `notifications/cancelled`, `notifications/progress` and the rest are
+     accepted and ignored.
+   - A request whose handling throws anywhere (the host's `:tools-list`, a
+     result JSON cannot carry…) is answered -32603 with a reference, the
+     Throwable going to `:on-fault`; a tool call that throws is an `isError`
+     result with a reference instead. Nothing of the Throwable is sent.
+   - A non-Request object gets -32600 Invalid Request echoing its :id when
+     present."
   [deps decoded ctx version]
-  (if-let [parsed (rpc/as-request decoded)]
-    (dispatch-method deps parsed ctx version)
-    (rpc/error (when (map? decoded) (:id decoded)) -32600 "Invalid Request")))
+  (if-let [{:keys [id method] :as parsed} (rpc/as-request decoded)]
+    (when (some? id)
+      (try
+        (dispatch-method deps parsed ctx version)
+        (catch Throwable t
+          (when (fatal? t) (throw t))
+          (rpc/error id -32603 (internal-error-message (report-fault! deps t method))))))
+    (when-not (response? decoded)
+      (rpc/error (when (map? decoded) (:id decoded)) -32600 "Invalid Request"))))

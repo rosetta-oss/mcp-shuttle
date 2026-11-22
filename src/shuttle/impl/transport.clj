@@ -61,10 +61,12 @@
    - `:prompts-list` / `:prompt-get` — optional `(fn [ctx])` → the prompt
      descriptors, and `(fn [ctx name arguments])` → `{:description …
      :messages […]}` or `{:error message}`; with them, `prompts`;
-   - `:on-fault` — optional `(fn [reference ^Throwable e tool-name])`, called
-     when a tool THROWS. The client only ever sees a generic sentence plus the
-     opaque `reference`; the exception text (which may carry JDBC / SQL / path
-     details) goes here and nowhere else. Absent → the JDK's
+   - `:on-fault` — optional `(fn [reference ^Throwable e what])`, called when
+     anything THROWS: `what` is the tool's name for a tool call, else the
+     method (\"tools/list\"…), or \"http\" outside any message (the
+     authenticator, the rate limiter). The client only ever sees a generic
+     sentence plus the opaque `reference`; the exception text (which may carry
+     JDBC / SQL / path details) goes here and nowhere else. Absent → the JDK's
      `System.Logger` at ERROR;
    - `:rate-limit?` — optional `(fn [id] {:allowed? bool :retry-after-secs n})`.
      Absent means no limiting, which is a visible config fact rather than a
@@ -145,8 +147,8 @@
   (let [^java.io.InputStream in (:body request)
         cap (:max-body-bytes deps)]
     (cond
-      (nil? cap) {:text (slurp in)}
       (nil? in) {:text ""}
+      (nil? cap) {:text (slurp in)}
       :else
       (let [buf (byte-array 8192)
             out (java.io.ByteArrayOutputStream.)]
@@ -210,10 +212,24 @@
               {:status 202})))))
     (unauthorized deps)))
 
+(defn- guarded
+  "The last net: a Throwable from anywhere outside a message's own handling
+   (the host's authenticator or rate limiter, reading the body) becomes a 500
+   with a reference, the Throwable going to `:on-fault`. The host's HTTP stack
+   never gets to decide what an error page shows."
+  [deps f]
+  (try
+    (f)
+    (catch Throwable t
+      (when (core/fatal? t) (throw t))
+      {:status 500
+       :headers {"Content-Type" "application/json"}
+       :body (rpc/error nil -32603 (core/internal-error-message (core/report-fault! deps t "http")))})))
+
 (defn handle-post
   "POST /mcp — the single endpoint for all JSON-RPC messages."
   [deps request]
-  (if (origin-mismatch? request) origin-forbidden (handle-post* deps request)))
+  (if (origin-mismatch? request) origin-forbidden (guarded deps #(handle-post* deps request))))
 
 ;; ---------------------------------------------------------------------------
 ;; Legacy HTTP+SSE transport (2024-11-05) — compatibility layer
@@ -283,11 +299,16 @@
            (re-find (re-pattern (str "(?:^|&)" k "=([^&]+)")))
            second))
 
+(declare handle-sse* handle-messages*)
+
 (defn handle-sse
   "GET /mcp/sse — the old MCP transport's handshake + downstream channel."
   [deps request]
   (if (origin-mismatch? request)
     origin-forbidden
+    (guarded deps #(handle-sse* deps request))))
+
+(defn- handle-sse* [deps request]
     (if-let [{:keys [id]} (authenticate deps request)]
       (let [rl (allowed? deps id)]
         (if-not (:allowed? rl)
@@ -319,7 +340,7 @@
             ;; Cap reached — refuse the open with the same 429 shape, so the
             ;; parked-thread exhaustion can't be opened past the cap.
             (rate-limited sse-cap-retry-after-secs))))
-      (unauthorized deps))))
+      (unauthorized deps)))
 
 (defn handle-messages
   "POST /mcp/messages?sessionId=… — the old MCP transport's upstream leg: parse
@@ -328,6 +349,9 @@
   [deps request]
   (if (origin-mismatch? request)
     origin-forbidden
+    (guarded deps #(handle-messages* deps request))))
+
+(defn- handle-messages* [deps request]
     (if-let [{:keys [id ctx]} (authenticate deps request)]
       (let [rl (allowed? deps id)]
         (if-not (:allowed? rl)
@@ -365,4 +389,4 @@
                       {:status 404 :headers {"Content-Type" "application/json"}
                        :body (rpc/error nil -32002
                                         "Unknown session — open GET /mcp/sse first")}))))))))
-      (unauthorized deps))))
+      (unauthorized deps)))

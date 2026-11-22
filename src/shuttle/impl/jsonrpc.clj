@@ -28,9 +28,10 @@
 (defn as-request
   "Coerce an already-decoded JSON value to a JSON-RPC 2.0 request map
    {:method :params :id}, or nil when it isn't a well-formed Request (e.g. a
-   non-object, or an object without :jsonrpc \"2.0\") — an -32600 Invalid Request."
+   non-object, or an object without :jsonrpc \"2.0\" or without a string
+   :method) — an -32600 Invalid Request."
   [m]
-  (when (and (map? m) (= "2.0" (:jsonrpc m)))
+  (when (and (map? m) (= "2.0" (:jsonrpc m)) (string? (:method m)))
     {:method (:method m) :params (:params m) :id (:id m)}))
 
 (defn success [id result]

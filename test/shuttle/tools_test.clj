@@ -114,5 +114,5 @@
 (deftest core-without-transport
   (testing "initialize negotiates and a notification has no reply"
     (is (= "2025-06-18" (get-in (ask "initialize" {:protocolVersion "2025-06-18"}) [:result :protocolVersion])))
-    (is (= "2025-03-26" (get-in (ask "initialize" {:protocolVersion "1999-01-01"}) [:result :protocolVersion])))
+    (is (= "2025-06-18" (get-in (ask "initialize" {:protocolVersion "1999-01-01"}) [:result :protocolVersion])))
     (is (nil? (core/handle (deps) {:jsonrpc "2.0" :method "notifications/initialized"} {} "2025-06-18")))))

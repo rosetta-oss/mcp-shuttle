@@ -5,6 +5,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-22
+
+### Fixed
+- Nothing thrown reaches the host's HTTP stack any more. A request whose handling throws outside a
+  tool call (the host's `:tools-list`, resources, prompts) is answered -32603 with a reference; a tool
+  result JSON cannot carry (a `LocalDate`, `NaN`) and an `Error` thrown by a tool (an `AssertionError`)
+  are tool faults with a reference, like an exception; a failing `:authenticate` or `:rate-limit?` is a
+  500 with a reference; a request without a body is a parse error. `:on-fault` receives all of them: its
+  third argument is the tool's name, else the method, or `"http"`.
+- A notification is never answered. `notifications/cancelled`, `notifications/progress` and any other
+  message without an id got a -32601 error with HTTP 200; they now get 202 and no body, as does a
+  JSON-RPC response sent to the server. A message without a string `method` is -32600.
+- The client shares one `HttpClient` (per connect timeout) between connections. A one-shot `call-tool`
+  used to build one per call and leave its threads to the garbage collector.
+
+### Changed
+- `initialize` answers a protocol revision it does not speak with the newest one it does (2025-06-18)
+  instead of 2025-03-26, as the specification asks. A client asking for 2025-11-25 now gets `title`,
+  `outputSchema` and `structuredContent`.
+
+### Added
+- Client options `:connect-timeout-ms` (documented) and `:http-client` (a host's own `HttpClient`).
+
 ## [0.1.0] - 2026-11-17
 
 First release.
@@ -23,5 +46,6 @@ First release.
   event-stream answers; session re-initialize on 404.
 - `shuttle.json`: keywords keep their namespace when written.
 
-[Unreleased]: https://github.com/rosetta-oss/mcp-shuttle/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/rosetta-oss/mcp-shuttle/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/rosetta-oss/mcp-shuttle/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/rosetta-oss/mcp-shuttle/releases/tag/v0.1.0

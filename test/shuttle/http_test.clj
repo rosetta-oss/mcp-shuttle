@@ -84,16 +84,17 @@
       (is (= 401 (:status r))))))
 
 (deftest initialize-negotiates-the-protocol-version
-  "The spec's rule: echo a version we speak, otherwise answer with our
-   preferred one — never fail the handshake over it."
+  "The spec's rule: echo a version we speak, otherwise answer with the newest
+   one we speak — never fail the handshake over it."
   (testing "a version we speak comes back unchanged"
     (is (= "2024-11-05"
            (get-in (body-of (post (deps) (rpc "initialize" {:protocolVersion "2024-11-05"})))
                    [:result :protocolVersion]))))
-  (testing "one we do not speak gets our preferred version, not an error"
-    (let [r (body-of (post (deps) (rpc "initialize" {:protocolVersion "1999-01-01"})))]
-      (is (= "2025-03-26" (get-in r [:result :protocolVersion])))
-      (is (nil? (:error r)))))
+  (testing "one we do not speak, older or newer, gets the newest we do, not an error"
+    (doseq [asked ["1999-01-01" "2025-11-25" "2099-01-01"]]
+      (let [r (body-of (post (deps) (rpc "initialize" {:protocolVersion asked})))]
+        (is (= "2025-06-18" (get-in r [:result :protocolVersion])) asked)
+        (is (nil? (:error r))))))
   (testing "serverInfo and instructions are the host's"
     (let [r (body-of (post (deps) (rpc "initialize")))]
       (is (= {:name "test-mcp" :version "1"} (get-in r [:result :serverInfo])))
@@ -466,3 +467,72 @@
                         ns (re-seq #"\[([a-z][\w.\-]*) " (or req ""))
                         :when (not (re-matches #"(shuttle|clojure|java|malli)\..*" (second ns)))]
                     [path (second ns)]))))))
+
+;; ---------------------------------------------------------------------------
+;; What is never answered, and what never escapes
+;; ---------------------------------------------------------------------------
+
+(deftest notifications-and-responses-get-no-reply
+  "A message without an id is a notification and a notification is never
+   answered, whatever its method: a client that cancels a request must not be
+   sent an error for saying so."
+  (doseq [m [{:jsonrpc "2.0" :method "notifications/cancelled" :params {:requestId 1}}
+             {:jsonrpc "2.0" :method "notifications/progress" :params {:progress 1}}
+             {:jsonrpc "2.0" :method "notifications/made-up"}
+             ;; a request method sent as a notification is not run either
+             {:jsonrpc "2.0" :method "tools/call" :params {:name "boom"}}
+             ;; a response to a request this server never sent
+             {:jsonrpc "2.0" :id 5 :result {}}
+             {:jsonrpc "2.0" :id 5 :error {:code -1 :message "x"}}]]
+    (let [r (post (deps) m)]
+      (is (= 202 (:status r)) (pr-str m))
+      (is (str/blank? (str (:body r))) (pr-str m))))
+  (testing "in a batch they contribute nothing"
+    (let [r (post (deps) [{:jsonrpc "2.0" :method "notifications/cancelled"} (rpc "ping" nil 9)])]
+      (is (= [9] (map :id (json/read (:body r)))))))
+  (testing "an object that is neither request, notification nor response is still Invalid Request"
+    (is (= -32600 (get-in (body-of (post (deps) {:jsonrpc "2.0" :id 1})) [:error :code])))
+    (is (= -32600 (get-in (body-of (post (deps) {:jsonrpc "2.0" :id 1 :method 7})) [:error :code])))))
+
+(deftest nothing-thrown-reaches-the-host
+  "Whatever throws, the handler returns a response: the host's HTTP stack never
+   gets to print the Throwable, and the client is told a reference and nothing else."
+  (let [seen (atom [])
+        d (fn [over] (deps (merge {:on-fault (fn [reference e what] (swap! seen conj [reference (ex-message e) what]))} over)))
+        secret "jdbc://secret-host/db"
+        clean? (fn [r] (not (str/includes? (str (:body r)) "secret")))]
+    (testing "the host's :tools-list throws"
+      (reset! seen [])
+      (let [r (post (d {:tools-list (fn [_] (throw (ex-info secret {})))}) (rpc "tools/list"))
+            e (:error (body-of r))]
+        (is (= 200 (:status r)))
+        (is (= -32603 (:code e)))
+        (is (clean? r))
+        (is (= [[secret "tools/list"]] (map rest @seen)))
+        (is (str/includes? (:message e) (ffirst @seen)) "the reference logged is the one sent")))
+    (testing "a result JSON cannot carry is the tool's fault"
+      (doseq [bad [{:d (java.time.LocalDate/of 2026 1 1)} {:x Double/NaN}]]
+        (reset! seen [])
+        (let [r (post (d {:call-tool (fn [& _] bad)}) (rpc "tools/call" {:name "echo"}))
+              res (:result (body-of r))]
+          (is (= 200 (:status r)))
+          (is (true? (:isError res)))
+          (is (str/includes? (get-in res [:content 0 :text]) (ffirst @seen)))
+          (is (= "echo" (last (first @seen)))))))
+    (testing "an Error, not only an Exception"
+      (let [r (post (d {:call-tool (fn [& _] (assert false secret))}) (rpc "tools/call" {:name "echo"}))]
+        (is (true? (get-in (body-of r) [:result :isError])))
+        (is (clean? r))))
+    (testing "the authenticator or the rate limiter throws: 500 with a reference"
+      (doseq [over [{:authenticate (fn [_] (throw (ex-info secret {})))}
+                    {:rate-limit? (fn [_] (throw (ex-info secret {})))}]]
+        (reset! seen [])
+        (let [r (post (d over) (rpc "ping"))]
+          (is (= 500 (:status r)))
+          (is (= -32603 (get-in (body-of r) [:error :code])))
+          (is (clean? r))
+          (is (= "http" (last (first @seen)))))))
+    (testing "a request with no body is a parse error, not an exception"
+      (let [r ((mcp/routes (deps)) {:request-method :post :uri "/mcp" :headers {"authorization" (str "Bearer " good)}})]
+        (is (= 400 (:status r)))
+        (is (= -32700 (get-in (body-of r) [:error :code])))))))

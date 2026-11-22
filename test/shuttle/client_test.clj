@@ -168,3 +168,18 @@
     (with-server [url (scripted (fn [_ _] {:status 404}) :session (constantly "s"))]
       (let [e (is (thrown? clojure.lang.ExceptionInfo (client/call-tool {:url url} "t" {})))]
         (is (= "MCP 404 on t" (ex-message e)))))))
+
+(deftest one-http-client-for-all-connections
+  (testing "connections share an HttpClient, so one-shot calls leave no threads or sockets behind"
+    (is (identical? (:http (client/connect {:url "http://x/mcp"})) (:http (client/connect {:url "http://y/mcp" :bearer "k"}))))
+    (is (not (identical? (:http (client/connect {:url "http://x/mcp"}))
+                         (:http (client/connect {:url "http://x/mcp" :connect-timeout-ms 1234})))))
+    (let [own (java.net.http.HttpClient/newHttpClient)]
+      (is (identical? own (:http (client/connect {:url "http://x/mcp" :http-client own}))))))
+  (testing "many one-shot calls do not grow the thread count"
+    (with-server [url real]
+      (let [threads #(count (filter (fn [^Thread t] (str/starts-with? (.getName t) "HttpClient")) (keys (Thread/getAllStackTraces))))]
+        (client/call-tool {:url url :bearer "k"} "echo" {:text "warm"})
+        (let [before (threads)]
+          (dotimes [_ 100] (client/call-tool {:url url :bearer "k"} "echo" {:text "hi"}))
+          (is (<= (threads) (+ before 2))))))))

@@ -23,7 +23,8 @@
    (call-tool {:url \"http://host:port/mcp\" :bearer key} \"templates\" {:limit 200})
    ```
    opens, initializes, calls and closes. For several calls, `connect` once, `call-tool` on the
-   connection, then `close`."
+   connection, then `close`: that saves the handshake each time. Either way the HttpClient and
+   its TCP connections are shared and reused."
   (:require [clojure.string :as str]
             [shuttle.json :as json])
   (:import (java.io BufferedReader InputStream InputStreamReader)
@@ -44,10 +45,19 @@
 
 (def ^:private default-timeout-ms 60000)
 
-(defn- http-client ^HttpClient [{:keys [connect-timeout-ms] :or {connect-timeout-ms 20000}}]
-  (-> (HttpClient/newBuilder)
-      (.connectTimeout (Duration/ofMillis connect-timeout-ms))
-      (.build)))
+(defonce ^:private http-clients (atom {}))
+
+(defn- http-client
+  "One HttpClient per connect timeout, shared by every connection: an
+   HttpClient owns threads and a pool of TCP connections, so one per call
+   would leave both behind until garbage collection and open a new socket
+   each time. It holds no credential; those travel per request."
+  ^HttpClient [{:keys [connect-timeout-ms] :or {connect-timeout-ms 20000}}]
+  (let [made (delay (-> (HttpClient/newBuilder)
+                        (.connectTimeout (Duration/ofMillis connect-timeout-ms))
+                        (.build)))]
+    @(get (swap! http-clients #(if (contains? % connect-timeout-ms) % (assoc % connect-timeout-ms made)))
+          connect-timeout-ms)))
 
 ;; ---------------------------------------------------------------------------
 ;; One exchange
@@ -209,6 +219,9 @@
    - `:bearer`      sent as `Authorization: Bearer …`
    - `:headers`     more request headers
    - `:timeout-ms`  per request, including reading an event stream (default 60000)
+   - `:connect-timeout-ms` for opening a TCP connection (default 20000)
+   - `:http-client` a `java.net.http.HttpClient` of the host's own (proxy, TLS settings);
+                    by default connections share one
    - `:label`       prefix of every error message (default \"MCP\")
    - `:client-info` `{:name … :version …}` sent on initialize"
   [{:keys [url timeout-ms label client-info] :as opts}]
@@ -217,7 +230,7 @@
          {:timeout-ms (or timeout-ms default-timeout-ms)
           :label (or label "MCP")
           :client-info (or client-info {:name "mcp-shuttle" :version "0"})
-          :http (http-client opts)
+          :http (or (:http-client opts) (http-client opts))
           :ids (atom 0)
           :state (atom {})}))
 
