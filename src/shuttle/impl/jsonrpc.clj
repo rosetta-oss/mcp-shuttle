@@ -44,12 +44,14 @@
   "MCP tools/call success result. A string is sent as-is; anything else is
    JSON-encoded into the single text block. With `structured` (a map), the
    same value also goes out as `structuredContent` (MCP 2025-06-18) — the
-   text block stays first and unchanged, for every client that reads only it."
+   text block stays first and unchanged, for every client that reads only it.
+   The value is written as JSON once: the structured copy reuses the text."
   ([id content] (tool-content id content nil))
   ([id content structured]
-   (success id (cond-> {:content [{:type "text"
-                                   :text (if (string? content) content (json/write content))}]}
-                 (map? structured) (assoc :structuredContent structured)))))
+   (let [text (if (string? content) content (json/write content))]
+     (success id (cond-> {:content [{:type "text" :text text}]}
+                   (map? structured)
+                   (assoc :structuredContent (if (identical? structured content) (json/raw text) structured)))))))
 
 (defn tool-error
   "MCP tools/call error result (isError true)."

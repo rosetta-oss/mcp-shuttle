@@ -116,3 +116,72 @@
     (is (= "2025-06-18" (get-in (ask "initialize" {:protocolVersion "2025-06-18"}) [:result :protocolVersion])))
     (is (= "2025-06-18" (get-in (ask "initialize" {:protocolVersion "1999-01-01"}) [:result :protocolVersion])))
     (is (nil? (core/handle (deps) {:jsonrpc "2.0" :method "notifications/initialized"} {} "2025-06-18")))))
+
+(def ^:dynamic *who* nil)
+
+(deftest undeclared-arguments
+  (let [d (fn [t] (merge (tools/deps [t]) {:server-info {:name "t" :version "1"}}))
+        run (fn [t args] (:result (json/read (core/handle (d t) {:jsonrpc "2.0" :id 1 :method "tools/call" :params {:name "t" :arguments args}} {} "2025-06-18"))))
+        t {:name "t" :input [:map [:limit {:optional true} :int]] :handler (fn [_ args] {:got args})}]
+    (testing "a misspelt name is refused, with the names the tool accepts"
+      (let [r (run t {:limt 5})
+            body (json/read (get-in r [:content 0 :text]))]
+        (is (true? (:isError r)))
+        (is (= "invalid_arguments" (:code body)))
+        (is (contains? (:details body) :limt))
+        (is (= ["limit"] (:accepts body)))))
+    (testing "and the announced schema says so"
+      (is (false? (get-in (first ((:tools-list (d t)) {})) [:inputSchema :additionalProperties]))))
+    (testing ":extra-args :allow lets them through"
+      (is (= {:got {:limt 5}} (json/read (get-in (run (assoc t :extra-args :allow) {:limt 5}) [:content 0 :text])))))
+    (testing "a schema that says {:closed false} itself is left open"
+      (is (nil? (:isError (run (assoc t :input [:map {:closed false} [:limit {:optional true} :int]]) {:limt 5})))))))
+
+(deftest refusals-and-answers
+  (let [run (fn [t] (let [d (merge (tools/deps [(assoc t :name "t")]) {:server-info {:name "t" :version "1"}})]
+                      (:result (json/read (core/handle d {:jsonrpc "2.0" :id 1 :method "tools/call" :params {:name "t"}} {} "2025-06-18")))))
+        text #(json/read (get-in % [:content 0 :text]))]
+    (testing "refuse marks a refusal"
+      (let [r (run {:handler (fn [_ _] (tools/refuse "closed" {:code "ledger_closed"}))})]
+        (is (true? (:isError r)))
+        (is (= {:error "closed" :code "ledger_closed"} (text r)))))
+    (testing "a refusal is one even from a tool with :output"
+      (is (true? (:isError (run {:output [:map [:n :int]] :handler (fn [_ _] (tools/refuse "no"))})))))
+    (testing "a result that fits :output is an answer though it has an :error field"
+      (let [r (run {:output [:map [:rows :int] [:error :string]] :handler (fn [_ _] {:rows 3 :error "a column of the data"})})]
+        (is (nil? (:isError r)))
+        (is (= {:rows 3 :error "a column of the data"} (:structuredContent r)))))
+    (testing "answer does the same for a tool without :output"
+      (is (nil? (:isError (run {:handler (fn [_ _] (tools/answer {:rows 3 :error "data"}))})))))
+    (testing "an unmarked map with :error is still a refusal"
+      (is (true? (:isError (run {:handler (fn [_ _] {:error "old style"})})))))))
+
+(deftest timeouts
+  (let [stopped (promise)
+        run (fn [t] (let [d (merge (tools/deps [(assoc t :name "t")]) {:server-info {:name "t" :version "1"}})]
+                      (:result (json/read (core/handle d {:jsonrpc "2.0" :id 1 :method "tools/call" :params {:name "t" :arguments {}}} {:who "ann"} "2025-06-18")))))]
+    (testing ":on-timeout is told, with the call's ctx and arguments"
+      (let [r (run {:timeout-ms 100 :handler (fn [_ _] (Thread/sleep 5000) "late")
+                    :on-timeout (fn [ctx args] (deliver stopped [ctx args]))})]
+        (is (true? (:isError r)))
+        (is (= [{:who "ann"} {}] (deref stopped 1000 :never)))))
+    (testing "a blocked handler is interrupted"
+      (let [interrupted (promise)]
+        (run {:timeout-ms 100 :handler (fn [_ _] (try (Thread/sleep 5000) (catch InterruptedException _ (deliver interrupted true))))})
+        (is (true? (deref interrupted 1000 false)))))
+    (testing "the handler sees the caller's dynamic bindings"
+      (is (= "bound" (get-in (binding [*who* "bound"] (run {:timeout-ms 1000 :handler (fn [_ _] *who*)})) [:content 0 :text]))))))
+
+(deftest per-caller-definitions-compile-once
+  (let [compiles (atom 0)
+        real @#'tools/compile-schemas
+        fresh (fn [_] [{:name "a" :input [:map [:n :int] [:unique-to-this-test :string]] :output [:map [:n :int]]
+                        :handler (fn [_ {:keys [n]}] {:n n})}])]
+    (with-redefs [tools/compile-schemas (fn [& xs] (swap! compiles inc) (apply real xs))]
+      (let [d (tools/deps fresh)]
+        (dotimes [_ 50]
+          ((:tools-list d) {})
+          (is (= {:n 1} ((:call-tool d) {} "a" {:n 1 :unique-to-this-test "x"}))))
+        (is (= 1 @compiles) "definitions built anew on every call, compiled once")))
+    (testing "duplicate names from a definitions function are refused too"
+      (is (thrown? Exception ((:tools-list (tools/deps (fn [_] [{:name "x" :handler identity} {:name "x" :handler identity}]))) {}))))))

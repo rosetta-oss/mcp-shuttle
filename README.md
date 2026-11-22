@@ -65,7 +65,8 @@ Needs Java 21 or later. Changes are in [CHANGELOG.md](CHANGELOG.md).
 
 `routes` returns nil for any other path, so it composes with a host's own routes. See the docstrings
 of `shuttle.http` and `shuttle.tools` for every injected function and tool option. A tool refuses by
-returning `{:error …}` (sent to the agent as JSON) and fails by throwing.
+returning `(tools/refuse "why" {:code "…"})` (sent to the agent as JSON) and fails by throwing. An
+argument the `:input` schema does not declare is refused, with the names the tool accepts.
 
 ## Two profiles
 

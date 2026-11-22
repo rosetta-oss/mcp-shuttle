@@ -145,6 +145,17 @@
   (str "the tool failed with an internal server error (reference " reference
        "); the server log has the details under that reference"))
 
+(defn- refusal?
+  "Whether a tool's result is a refusal. Marked results say so themselves
+   (`shuttle.tools/refuse`, `shuttle.tools/answer`); an unmarked map with a
+   truthy `:error` is a refusal, the older convention."
+  [result]
+  (and (map? result)
+       (let [m (meta result)]
+         (cond (:mcp/refusal m) true
+               (:mcp/answer m) false
+               :else (boolean (:error result))))))
+
 (defn- handle-tools-call
   "A thrown Throwable is a SERVER fault, not an answer (refusals travel as
    `{:error …}` data). Its message is NOT forwarded: a JDBC/SQL text can name
@@ -155,7 +166,7 @@
   (let [{:keys [name arguments]} params]
     (try
       (let [result ((:call-tool deps) ctx name (or arguments {}))]
-        (if (:error result)
+        (if (refusal? result)
           ;; A refusal is an answer: hand the agent the whole structured
           ;; finding, because "which key was wrong" is exactly what it needs
           ;; to fix the next call.
