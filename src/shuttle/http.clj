@@ -41,7 +41,20 @@
    - `:rate-limit?` — optional `(fn [id] {:allowed? … :retry-after-secs …})`.
      Absent means no limiting: a visible config fact, not a silent default;
    - `:max-body-bytes` — optional cap on one POSTed message, refused with 413
-     and JSON-RPC -32600 naming the cap. Absent means no cap."
+     and JSON-RPC -32600 naming the cap. Absent means no cap;
+   - `:max-batch` — the most messages in one JSON-RPC batch (default 50): a
+     batch passes the rate limit as one request;
+   - `:allowed-origins` — a set of browser origins (\"https://app.example.com\")
+     allowed besides the request's own Host, for a page meant to call this
+     server and for a proxy that rewrites Host;
+   - `:path` — where the endpoint is mounted (default \"/mcp\");
+     `:public-path` — the path clients see when a proxy in front adds a
+     prefix (the HTTP+SSE handshake announces `<public-path>/messages`);
+   - `:sse-max-sessions` (default 256), `:sse-max-sessions-per-caller`
+     (default 8) — open HTTP+SSE streams allowed at once;
+   - `:sessions` — `(new-sessions)`, made once and kept by the host, gives an
+     endpoint HTTP+SSE sessions and caps of its own. Without it every
+     endpoint in the process shares one table, as before."
   (:require [shuttle.impl.transport :as transport]))
 
 (defn routes
@@ -49,17 +62,24 @@
    composes with a host's own routes. **Does not start a server**: feed it a
    request map to test.
 
+   The routes are `:path` (default \"/mcp\"), `<path>/sse` and
+   `<path>/messages`.
+
    Every host mounts THIS, so the route set cannot drift between hosts."
   [deps]
-  (fn [{:keys [request-method uri] :as request}]
-    (case [request-method uri]
-      [:post "/mcp"] (transport/handle-post deps request)
-      [:get "/mcp"] (transport/handle-get request)
-      ;; The 2024-11-05 transport, kept because many clients and gateways still
-      ;; speak only it. Same dispatch, same auth; only the framing differs.
-      [:get "/mcp/sse"] (transport/handle-sse deps request)
-      [:post "/mcp/messages"] (transport/handle-messages deps request)
-      nil)))
+  (let [path (or (:path deps) "/mcp")
+        sse (str path "/sse")
+        messages (str path "/messages")
+        deps (assoc deps :path path)]
+    (fn [{:keys [request-method uri] :as request}]
+      (condp = [request-method uri]
+        [:post path] (transport/handle-post deps request)
+        [:get path] (transport/handle-get request)
+        ;; The 2024-11-05 transport, kept because many clients and gateways still
+        ;; speak only it. Same dispatch, same auth; only the framing differs.
+        [:get sse] (transport/handle-sse deps request)
+        [:post messages] (transport/handle-messages deps request)
+        nil))))
 
 (def data-methods
   "What the data profile answers: the handshake and tools, nothing else."
@@ -98,23 +118,36 @@
 
 (defn rate-limiter
   "A `:rate-limit?` for one process: at most `n` requests per caller id in any
-   `per-ms` window (a sliding window kept per id). Several instances behind a
-   balancer each count on their own; a shared limit needs the host's own
-   function."
+   `per-ms` window (a sliding window kept per id). Callers not seen for a
+   window are forgotten. Several instances behind a balancer each count on
+   their own; a shared limit needs the host's own function."
   [n per-ms]
-  (let [seen (atom {})]
+  (let [state (atom {:calls 0 :seen {}})
+        fresh (fn [since ts] (filterv #(> % since) ts))]
     (fn [id]
       (let [now (System/currentTimeMillis)
             since (- now per-ms)
-            [old] (swap-vals! seen update id
-                              (fn [ts]
-                                (let [ts (filterv #(> % since) ts)]
-                                  (if (< (count ts) n) (conj ts now) ts))))
-            before (filterv #(> % since) (get old id))]
+            [old] (swap-vals! state
+                              (fn [{:keys [calls seen]}]
+                                (let [ts (fresh since (get seen id))
+                                      seen (assoc seen id (if (< (count ts) n) (conj ts now) ts))
+                                      calls (inc calls)]
+                                  {:calls calls
+                                   ;; every so often, drop the callers whose window has emptied
+                                   :seen (if (zero? (mod calls 1024))
+                                           (into {} (filter (fn [[_ ts]] (some #(> % since) ts))) seen)
+                                           seen)})))
+            before (fresh since (get-in old [:seen id]))]
         (if (< (count before) n)
           {:allowed? true}
           {:allowed? false
            :retry-after-secs (max 1 (long (Math/ceil (/ (- (+ (first before) per-ms) now) 1000.0))))})))))
+
+(defn new-sessions
+  "A table of HTTP+SSE sessions for the `:sessions` dep. Make it once, where
+   the host builds its deps: a table made per request loses every session."
+  []
+  (transport/new-sessions))
 
 (defn bearer
   "The request's Bearer credential, or nil.

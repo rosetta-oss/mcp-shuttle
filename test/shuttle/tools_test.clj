@@ -185,3 +185,19 @@
         (is (= 1 @compiles) "definitions built anew on every call, compiled once")))
     (testing "duplicate names from a definitions function are refused too"
       (is (thrown? Exception ((:tools-list (tools/deps (fn [_] [{:name "x" :handler identity} {:name "x" :handler identity}]))) {}))))))
+
+(deftest tool-names
+  (doseq [bad ["has space" "slash/name" "" (apply str (repeat 129 "a")) "naïve"]]
+    (is (thrown? Exception (tools/deps [{:name bad :handler identity}])) bad))
+  (doseq [good ["a" "list_orders" "orders.list" "get-order-2" (apply str (repeat 128 "a"))]]
+    (is (some? (tools/deps [{:name good :handler identity}])) good)))
+
+(deftest content-blocks
+  (let [run (fn [t] (let [d (merge (tools/deps [(assoc t :name "t")]) {:server-info {:name "t" :version "1"}})]
+                      (:result (json/read (core/handle d {:jsonrpc "2.0" :id 1 :method "tools/call" :params {:name "t"}} {} "2025-06-18")))))
+        blocks [{:type "text" :text "a chart"} {:type "image" :data "aGk=" :mimeType "image/png"}]]
+    (is (= {:content blocks} (run {:handler (fn [_ _] (tools/content blocks))})))
+    (testing "with more, and past an :output schema"
+      (is (= {:content blocks :_meta {:took 3} :structuredContent {:n 1}}
+             (run {:output [:map [:n :int]]
+                   :handler (fn [_ _] (tools/content blocks {:_meta {:took 3} :structuredContent {:n 1}}))}))))))

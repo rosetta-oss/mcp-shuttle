@@ -65,6 +65,15 @@
   ([message] (refuse message nil))
   ([message more] (vary-meta (assoc (or more {}) :error message) assoc :mcp/refusal true)))
 
+(defn content
+  "A handler's result as MCP content blocks, sent as they are instead of one
+   text block: `(content [{:type \"text\" :text \"…\"} {:type \"image\" :data b64
+   :mimeType \"image/png\"}])`. `more` is merged into the result
+   (`:structuredContent`, `:_meta`, `:isError`). The tool's `:output` schema
+   is not applied to it."
+  ([blocks] (content blocks nil))
+  ([blocks more] (vary-meta (assoc (or more {}) :content (vec blocks)) assoc :mcp/content true)))
+
 (defn answer
   "Marks a handler's result as an answer, not a refusal, though it has an
    `:error` field. Not needed for a tool whose `:output` schema the result fits."
@@ -78,7 +87,9 @@
     (if (= "object" (:type js)) js (merge js any-object))))
 
 (defn- check-definition! [{:keys [name handler] :as t}]
-  (when-not (and (string? name) (seq name)) (throw (ex-info "tool :name must be a non-empty string" {:tool t})))
+  ;; the specification's rule for tool names (2025-11-25); clients refuse others
+  (when-not (and (string? name) (re-matches #"[A-Za-z0-9_.-]{1,128}" name))
+    (throw (ex-info "tool :name must be 1 to 128 characters of A-Z a-z 0-9 _ . -" {:name name})))
   (when-not (fn? handler) (throw (ex-info (str "tool " name ": :handler must be a function") {})))
   t)
 
@@ -152,7 +163,7 @@
             marks (meta result)]
         (cond
           (= ::timed-out result) (refuse (str "the tool did not finish within " (:timeout-ms t) " ms") {:code "timeout"})
-          (:mcp/refusal marks) result
+          (or (:mcp/refusal marks) (:mcp/content marks)) result
           ;; a result that fits :output is an answer, :error field or not
           (and (::valid-out? t) ((::valid-out? t) result))
           (if (map? result) (vary-meta result assoc :mcp/structured-content true :mcp/answer true) result)

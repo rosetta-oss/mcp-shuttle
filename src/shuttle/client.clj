@@ -5,9 +5,12 @@
   "MCP client over Streamable HTTP, for a service calling another service's tools.
 
    Every failure throws an `ex-info`; nothing is printed and nothing returns nil:
-   - HTTP status outside 2xx      → \"<label> <status> on <op>\", data `{:status …}`
+   - HTTP status outside 2xx      → \"<label> <status> on <op>\", data `{:status …}`, and for a
+                                     429 `:retry-after-secs` when the server says
    - JSON-RPC `error`              → \"<label> <op>: <message>\", data `{:code …}`
-   - tool result with `isError`    → \"<label> <tool>: <text>\", data `{:result …}`
+   - tool result with `isError`    → \"<label> <tool>: <text>\", data `{:result …}`; when the text
+                                     is a JSON object, also `:error` (it, keys as keywords) and
+                                     its `:code`, for a program to branch on
    - body that is not valid JSON   → \"<label> <op>: unreadable answer\"
    - no answer within `:timeout-ms` → \"<label> timed out on <op>\", data `{:timeout-ms …}`
    - no connection                 → \"<label> unreachable on <op>\", the IOException as cause
@@ -149,9 +152,12 @@
 (defn- status-error [conn op ^HttpResponse resp]
   (let [text (try (String. ^bytes (drain resp) StandardCharsets/UTF_8) (catch Exception _ ""))
         m (try (json/read text) (catch Exception _ nil))
-        code (when (map? m) (get-in m [:error :code]))]
+        code (when (map? m) (get-in m [:error :code]))
+        retry (some-> (.orElse (.firstValue (.headers resp) "retry-after") nil) str/trim parse-long)]
     (fail (str (:label conn) " " (.statusCode resp) " on " op)
-          (cond-> {:status (.statusCode resp)} code (assoc :code code)))))
+          (cond-> {:status (.statusCode resp)}
+            code (assoc :code code)
+            (and retry (= 429 (.statusCode resp))) (assoc :retry-after-secs retry)))))
 
 (defn- remember-session! [conn ^HttpResponse resp]
   (when-let [sid (.orElse (.firstValue (.headers resp) "mcp-session-id") nil)]
@@ -238,14 +244,12 @@
   (when-not (:version @(:state conn)) (initialize! conn))
   conn)
 
+(declare listing)
+
 (defn list-tools
   "The server's tools (follows `nextCursor`)."
   [conn]
-  (ready! conn)
-  (loop [cursor nil acc []]
-    (let [res (rpc! conn "tools/list" "tools/list" (when cursor {:cursor cursor}))
-          acc (into acc (:tools res))]
-      (if-let [c (:nextCursor res)] (recur c acc) acc))))
+  (listing conn "tools/list" :tools))
 
 (defn call-tool
   "Calls a tool and returns its result (`{:content […] …}`, keys as keywords). A result with
@@ -254,11 +258,49 @@
   (if (:http conn-or-opts)
     (let [res (rpc! (ready! conn-or-opts) tool "tools/call" {:name tool :arguments (or args {})})]
       (if (:isError res)
-        (fail conn-or-opts tool (or (some :text (:content res)) "tool error") {:result res})
+        (let [text (some :text (:content res))
+              said (when (and text (str/starts-with? (str/triml text) "{"))
+                     (try (json/read text) (catch Exception _ nil)))]
+          (fail conn-or-opts tool (or text "tool error")
+                (cond-> {:result res}
+                  (map? said) (assoc :error said)
+                  (and (map? said) (:code said)) (assoc :code (:code said)))))
         res))
     (let [conn (connect conn-or-opts)]
       (try (call-tool conn tool args)
            (finally (close conn))))))
+
+(defn- listing [conn method k]
+  (ready! conn)
+  (loop [cursor nil acc []]
+    (let [res (rpc! conn method method (when cursor {:cursor cursor}))
+          acc (into acc (get res k))]
+      (if-let [c (:nextCursor res)] (recur c acc) acc))))
+
+(defn list-resources
+  "The server's resources (follows `nextCursor`)."
+  [conn]
+  (listing conn "resources/list" :resources))
+
+(defn read-resource
+  "A resource's contents: `{:contents […]}`."
+  [conn uri]
+  (rpc! (ready! conn) uri "resources/read" {:uri uri}))
+
+(defn list-prompts
+  "The server's prompts (follows `nextCursor`)."
+  [conn]
+  (listing conn "prompts/list" :prompts))
+
+(defn get-prompt
+  "A prompt: `{:description … :messages […]}`."
+  [conn prompt-name args]
+  (rpc! (ready! conn) prompt-name "prompts/get" {:name prompt-name :arguments (or args {})}))
+
+(defn structured
+  "A tool result's `structuredContent`, or nil."
+  [result]
+  (:structuredContent result))
 
 (defn text
   "The text of a tool result's first text block, or nil."

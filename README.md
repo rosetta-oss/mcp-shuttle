@@ -102,6 +102,7 @@ and server sessions are handled, including initializing again once when a server
 
 ```
 clojure -M:test
+clojure -M:lint
 ```
 
 The test `the-wire-knows-no-business` scans the library's source: it must never learn a host's

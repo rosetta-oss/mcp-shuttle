@@ -5,6 +5,33 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-22
+
+### Added
+- `:path` on `routes` (default `/mcp`; the HTTP+SSE routes are `<path>/sse` and `<path>/messages`) and
+  `:public-path`, the path clients see behind a proxy that adds a prefix: the SSE handshake announces it.
+- `:allowed-origins`: browser origins allowed besides the request's own Host.
+- `:max-batch`: the most messages in one JSON-RPC batch (default 50).
+- `:sessions` (`shuttle.http/new-sessions`), `:sse-max-sessions`, `:sse-max-sessions-per-caller`: an endpoint's
+  own HTTP+SSE session table and caps. Without `:sessions`, endpoints in one process share a table, as before.
+- `shuttle.tools/content`: a handler returns MCP content blocks itself (several blocks, images, resource links,
+  `_meta`).
+- Client: `list-resources`, `read-resource`, `list-prompts`, `get-prompt`, `structured`; a 429's
+  `:retry-after-secs` and a refusal's parsed `:error` and `:code` in the exception's data.
+- `clojure -M:lint` (clj-kondo), run by CI.
+
+### Changed
+- A batch of more than 50 messages is refused (-32600); it used to pass the rate limit as one request.
+- `shuttle.tools`: a tool's `:name` must be 1 to 128 characters of `A-Z a-z 0-9 _ . -`, the specification's
+  rule.
+- `tools/call` without a `name` is -32602, not an "unknown tool" refusal.
+
+### Fixed
+- `bearer` reads the scheme case-insensitively (`bearer x`), as HTTP defines it.
+- A 401 carries `WWW-Authenticate: Bearer`.
+- `Retry-After` on a 429 is always a positive whole number, also when the host's limiter gives none.
+- `rate-limiter` forgets callers whose window has emptied instead of keeping every id it ever saw.
+
 ## [0.2.0] - 2026-11-22
 
 ### Changed
@@ -72,7 +99,8 @@ First release.
   event-stream answers; session re-initialize on 404.
 - `shuttle.json`: keywords keep their namespace when written.
 
-[Unreleased]: https://github.com/rosetta-oss/mcp-shuttle/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/rosetta-oss/mcp-shuttle/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/rosetta-oss/mcp-shuttle/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rosetta-oss/mcp-shuttle/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/rosetta-oss/mcp-shuttle/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/rosetta-oss/mcp-shuttle/releases/tag/v0.1.0

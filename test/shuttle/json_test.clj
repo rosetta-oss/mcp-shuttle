@@ -3,7 +3,7 @@
 
 (ns shuttle.json-test
   (:require [clojure.data.json :as dj]
-            [clojure.test :refer [deftest is testing]]
+            [clojure.test :refer [deftest is]]
             [shuttle.json :as json]))
 
 (deftest keywords-keep-their-namespace

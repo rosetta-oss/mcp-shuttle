@@ -164,21 +164,27 @@
    JSON cannot carry is the tool's fault too."
   [deps id params ctx version]
   (let [{:keys [name arguments]} params]
+    (if-not (and (string? name) (seq name))
+      (rpc/error id -32602 "tools/call needs params.name, the tool to call")
     (try
       (let [result ((:call-tool deps) ctx name (or arguments {}))]
-        (if (refusal? result)
+        (cond
+          ;; the handler built the result itself (shuttle.tools/content):
+          ;; several blocks, an image, a resource link, _meta
+          (:mcp/content (meta result)) (rpc/success id result)
+          (refusal? result)
           ;; A refusal is an answer: hand the agent the whole structured
           ;; finding, because "which key was wrong" is exactly what it needs
           ;; to fix the next call.
           (rpc/tool-error id (rpc/json-text result))
-          (rpc/tool-content id result (structured-content version result))))
+          :else (rpc/tool-content id result (structured-content version result))))
       (catch Throwable t
         (when (fatal? t) (throw t))
         (let [reference (report-fault! deps t name)]
           (rpc/tool-error id (if (= :data (:profile deps))
                                (rpc/json-text {:error "internal error" :code "internal_error"
                                                :reference reference})
-                               (fault-message reference))))))))
+                               (fault-message reference)))))))))
 
 (defn- optional-method
   "A method the host may not serve: -32601, exactly as an unknown method,

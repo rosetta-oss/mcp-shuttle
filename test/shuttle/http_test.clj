@@ -536,3 +536,93 @@
       (let [r ((mcp/routes (deps)) {:request-method :post :uri "/mcp" :headers {"authorization" (str "Bearer " good)}})]
         (is (= 400 (:status r)))
         (is (= -32700 (get-in (body-of r) [:error :code])))))))
+
+;; ---------------------------------------------------------------------------
+;; The small rules
+;; ---------------------------------------------------------------------------
+
+(defn- raw-post [d headers body & [uri]]
+  ((mcp/routes d) {:request-method :post :uri (or uri "/mcp")
+                   :headers (merge {"host" "127.0.0.1:9632" "authorization" (str "Bearer " good)} headers)
+                   :body (java.io.ByteArrayInputStream. (.getBytes (json/write body) "UTF-8"))}))
+
+(deftest the-bearer-scheme-is-case-insensitive
+  (doseq [auth ["bearer good" "BEARER good" "Bearer   good"]]
+    (is (= 200 (:status (raw-post (deps) {"authorization" auth} (rpc "ping")))) auth))
+  (is (= 401 (:status (raw-post (deps) {"authorization" "Basic good"} (rpc "ping")))))
+  (is (= 401 (:status (raw-post (deps) {"authorization" "Bearer"} (rpc "ping"))))))
+
+(deftest a-401-names-the-scheme
+  (is (= "Bearer" (get-in (post (deps) (rpc "ping") {:auth nil}) [:headers "WWW-Authenticate"]))))
+
+(deftest retry-after-is-always-a-number
+  (doseq [answer [{:allowed? false} {:allowed? false :retry-after-secs nil} {:allowed? false :retry-after-secs 0}
+                  {:allowed? false :retry-after-secs 2.2}]]
+    (let [r (post (deps {:rate-limit? (constantly answer)}) (rpc "ping"))]
+      (is (= 429 (:status r)))
+      (is (pos? (parse-long (get-in r [:headers "Retry-After"]))) (pr-str answer)))))
+
+(deftest the-limiter-forgets-idle-callers
+  (let [limit (mcp/rate-limiter 5 30)
+        state (some #(when (instance? clojure.lang.Atom %) %)
+                    (map #(.get ^java.lang.reflect.Field % limit)
+                         (doto (.getDeclaredFields (class limit)) (->> (run! #(.setAccessible ^java.lang.reflect.Field % true))))))]
+    (dotimes [i 1000] (limit (str "caller-" i)))
+    (Thread/sleep 60)
+    (dotimes [_ 100] (limit "the-one-still-here"))
+    (is (some? state))
+    (is (<= (count (:seen @state)) 3) "the thousand idle callers are gone")
+    (is (false? (:allowed? (limit "the-one-still-here"))) "and the limit still holds")))
+
+(deftest a-batch-has-a-cap
+  (let [batch (fn [n] (vec (repeat n (rpc "ping"))))]
+    (is (= 200 (:status (post (deps) (batch 50)))))
+    (let [r (post (deps) (batch 51))]
+      (is (= 400 (:status r)))
+      (is (= -32600 (get-in (body-of r) [:error :code]))))
+    (is (= 200 (:status (post (deps {:max-batch 60}) (batch 51)))))
+    (is (= 400 (:status (post (deps {:max-batch 2}) (batch 3)))))))
+
+(deftest tools-call-needs-a-name
+  (doseq [params [nil {} {:name ""} {:name 7}]]
+    (is (= -32602 (get-in (body-of (post (deps) (rpc "tools/call" params))) [:error :code])) (pr-str params))))
+
+(deftest allowed-origins
+  (let [from (fn [d origin] (:status (raw-post d {"origin" origin} (rpc "ping"))))]
+    (is (= 403 (from (deps) "https://app.example.com")))
+    (is (= 200 (from (deps {:allowed-origins #{"https://app.example.com"}}) "https://app.example.com")))
+    (is (= 403 (from (deps {:allowed-origins #{"https://app.example.com"}}) "https://evil.example.com")))
+    (is (= 200 (from (deps) "http://127.0.0.1:9632")) "the request's own host, as before")))
+
+(deftest the-endpoint-can-be-mounted-elsewhere
+  (let [d (deps {:path "/api/v2/mcp" :public-path "/gateway/api/v2/mcp"})]
+    (is (= 200 (:status (raw-post d {} (rpc "ping") "/api/v2/mcp"))))
+    (is (nil? (raw-post d {} (rpc "ping") "/mcp")))
+    (is (= 405 (:status ((mcp/routes d) {:request-method :get :uri "/api/v2/mcp"}))))
+    (testing "the SSE handshake announces the path clients see"
+      (let [stream ((mcp/routes d) {:request-method :get :uri "/api/v2/mcp/sse"
+                                    :headers {"host" "127.0.0.1:9632" "authorization" (str "Bearer " good)}})
+            out (java.io.ByteArrayOutputStream.)]
+        (doto (Thread. #((:body stream) out)) (.setDaemon true) (.start))
+        (Thread/sleep 120)
+        (is (str/includes? (str out) "data: /gateway/api/v2/mcp/messages?sessionId="))))))
+
+(deftest an-endpoint-can-have-sessions-of-its-own
+  (let [open (fn [d] (let [stream ((mcp/routes d) {:request-method :get :uri "/mcp/sse"
+                                                    :headers {"host" "127.0.0.1:9632" "authorization" (str "Bearer " good)}})
+                           out (java.io.ByteArrayOutputStream.)]
+                       (when (= 200 (:status stream))
+                         (doto (Thread. #((:body stream) out)) (.setDaemon true) (.start))
+                         (Thread/sleep 100)
+                         (second (re-find #"sessionId=([0-9a-f-]{36})" (str out))))))
+        ping (fn [d sid] (:status ((mcp/routes d) {:request-method :post :uri "/mcp/messages" :query-string (str "sessionId=" sid)
+                                                   :headers {"host" "127.0.0.1:9632" "authorization" (str "Bearer " good)}
+                                                   :body (java.io.ByteArrayInputStream. (.getBytes (json/write (rpc "ping")) "UTF-8"))})))
+        a (deps {:sessions (mcp/new-sessions) :sse-max-sessions-per-caller 1})
+        b (deps {:sessions (mcp/new-sessions)})
+        sid (open a)]
+    (is (some? sid))
+    (is (= 202 (ping a sid)))
+    (is (= 404 (ping b sid)) "another endpoint's table does not know it")
+    (is (nil? (open a)) "the endpoint's own cap of one stream per caller")
+    (is (some? (open b)) "which the other endpoint does not share")))

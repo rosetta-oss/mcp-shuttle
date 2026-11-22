@@ -27,4 +27,5 @@ jobs:
             ~/.m2/repository
             ~/.gitlibs
           key: deps-${{ hashFiles('deps.edn') }}
+      - run: clojure -M:lint
       - run: clojure -M:test

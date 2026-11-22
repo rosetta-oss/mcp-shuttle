@@ -183,3 +183,44 @@
         (let [before (threads)]
           (dotimes [_ 100] (client/call-tool {:url url :bearer "k"} "echo" {:text "hi"}))
           (is (<= (threads) (+ before 2))))))))
+
+(deftest what-a-program-can-branch-on
+  (testing "a 429 carries the server's Retry-After"
+    (with-server [url (mcp/routes {:authenticate (fn [_] {:id "c" :ctx {}}) :tools-list (fn [_] []) :call-tool (fn [& _] nil)
+                                   :server-info {:name "t" :version "1"}
+                                   :rate-limit? (constantly {:allowed? false :retry-after-secs 7})})]
+      (let [e (is (thrown? clojure.lang.ExceptionInfo (client/call-tool {:url url} "t" {})))]
+        (is (= {:status 429 :code -32029 :retry-after-secs 7} (ex-data e))))))
+  (testing "a refusal's JSON is parsed: :error and :code"
+    (with-server [url real]
+      (let [e (is (thrown? clojure.lang.ExceptionInfo (client/call-tool {:url url :bearer "k"} "nope" {})))]
+        (is (= {:error "no tool nope"} (:error (ex-data e))))
+        (is (nil? (:code (ex-data e))))))
+    (with-server [url (scripted (fn [id _] {:status 200 :headers {"Content-Type" "application/json"}
+                                            :body (result-json id {:isError true :content [{:type "text" :text "{\"error\":\"closed\",\"code\":\"ledger_closed\"}"}]})}))]
+      (let [e (is (thrown? clojure.lang.ExceptionInfo (client/call-tool {:url url} "t" {})))]
+        (is (= "ledger_closed" (:code (ex-data e)))))))
+  (testing "a refusal in plain words has no :error or :code"
+    (with-server [url (scripted (fn [id _] {:status 200 :headers {"Content-Type" "application/json"}
+                                            :body (result-json id {:isError true :content [{:type "text" :text "not today {really}"}]})}))]
+      (let [e (is (thrown? clojure.lang.ExceptionInfo (client/call-tool {:url url} "t" {})))]
+        (is (= "MCP t: not today {really}" (ex-message e)))
+        (is (= [:result] (keys (ex-data e))))))))
+
+(deftest resources-and-prompts
+  (with-server [url (mcp/routes {:authenticate (fn [_] {:id "c" :ctx {}}) :tools-list (fn [_] []) :call-tool (fn [& _] nil)
+                                 :server-info {:name "t" :version "1"}
+                                 :resources-list (fn [_] [{:uri "doc://a" :name "A"}])
+                                 :resource-read (fn [_ uri] (when (= uri "doc://a") {:contents [{:uri uri :text "hello"}]}))
+                                 :prompts-list (fn [_] [{:name "greet"}])
+                                 :prompt-get (fn [_ n args] (if (= n "greet")
+                                                              {:messages [{:role "user" :content {:type "text" :text (str "hi " (:who args))}}]}
+                                                              {:error "no such prompt"}))})]
+    (let [c (client/connect {:url url})]
+      (is (= ["doc://a"] (map :uri (client/list-resources c))))
+      (is (= "hello" (get-in (client/read-resource c "doc://a") [:contents 0 :text])))
+      (is (thrown? clojure.lang.ExceptionInfo (client/read-resource c "doc://nope")))
+      (is (= ["greet"] (map :name (client/list-prompts c))))
+      (is (= "hi ann" (get-in (client/get-prompt c "greet" {:who "ann"}) [:messages 0 :content :text])))
+      (is (thrown? clojure.lang.ExceptionInfo (client/get-prompt c "nope" nil)))
+      (client/close c))))

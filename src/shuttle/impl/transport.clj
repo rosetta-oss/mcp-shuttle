@@ -70,7 +70,17 @@
      `System.Logger` at ERROR;
    - `:rate-limit?` — optional `(fn [id] {:allowed? bool :retry-after-secs n})`.
      Absent means no limiting, which is a visible config fact rather than a
-     silent default."
+     silent default;
+   - `:max-batch` — the most messages one JSON-RPC batch may hold (default 50);
+   - `:allowed-origins` — a set of browser origins allowed besides the
+     request's own Host;
+   - `:path` / `:public-path` — where the endpoint is mounted (default
+     \"/mcp\") and, when a proxy in front adds a prefix, the path clients see:
+     the SSE handshake announces `<public-path>/messages`;
+   - `:sse-max-sessions` (default 256) and `:sse-max-sessions-per-caller`
+     (default 8) — how many HTTP+SSE streams may be open at once;
+   - `:sessions` — `(new-sessions)` kept by the host: this endpoint's own
+     HTTP+SSE session table. Absent, the process-wide one."
   (:require [clojure.string :as str]
             [shuttle.core :as core]
             [shuttle.impl.jsonrpc :as rpc])
@@ -79,18 +89,20 @@
            [java.util.concurrent LinkedBlockingQueue TimeUnit]))
 
 (def ^:private header-authorization "authorization")
-(def ^:private bearer-prefix "Bearer ")
 
 ;; ---------------------------------------------------------------------------
 ;; Shared request gates
 ;; ---------------------------------------------------------------------------
 
 (defn- origin-mismatch?
-  "True when the request carries an Origin header whose authority differs from
-   the request's own Host — the MCP spec's DNS-rebinding guard ('servers MUST
-   validate the Origin header'). Non-browser MCP clients send no Origin and
-   pass untouched; a browser page on another origin is refused."
-  [request]
+  "True when the request carries an Origin header that is neither the
+   request's own Host nor one of the host's `:allowed-origins` — the MCP
+   spec's DNS-rebinding guard ('servers MUST validate the Origin header').
+   Non-browser MCP clients send no Origin and pass untouched; a browser page
+   on another origin is refused. `:allowed-origins` is a set of origins as a
+   browser sends them (\"https://app.example.com\"): for a page that is meant
+   to call this server, and for a proxy that rewrites Host."
+  [deps request]
   (boolean
    (when-let [origin (get-in request [:headers "origin"])]
      (let [authority (-> origin
@@ -98,7 +110,8 @@
                          (str/split #"/")
                          first)
            host      (get-in request [:headers "host"])]
-       (and (seq authority) (some? host) (not= authority host))))))
+       (and (not (contains? (set (:allowed-origins deps)) origin))
+            (seq authority) (some? host) (not= authority host))))))
 
 (def ^:private origin-forbidden
   {:status 403
@@ -111,8 +124,9 @@
    prefix comparison to go wrong."
   [request]
   (let [auth (get-in request [:headers header-authorization])]
-    (when (and (string? auth) (str/starts-with? auth bearer-prefix))
-      (subs auth (count bearer-prefix)))))
+    ;; the scheme's name is case-insensitive (RFC 9110): "bearer x" is the same credential
+    (when (string? auth)
+      (second (re-matches #"(?i)Bearer +(\S.*)" auth)))))
 
 (defn- authenticate
   "Run the injected authenticator. → `{:id … :ctx …}`, or nil.
@@ -126,7 +140,7 @@
 
 (defn- unauthorized [deps]
   {:status 401
-   :headers {"Content-Type" "application/json"}
+   :headers {"Content-Type" "application/json" "WWW-Authenticate" "Bearer"}
    :body (rpc/error nil -32001 (:unauthorized-message deps))})
 
 (defn- allowed?
@@ -136,9 +150,10 @@
   (if-let [f (:rate-limit? deps)] (f id) {:allowed? true}))
 
 (defn- rate-limited [retry-after]
+  (let [retry-after (if (and (number? retry-after) (pos? retry-after)) (long (Math/ceil retry-after)) 1)]
   {:status 429
    :headers {"Content-Type" "application/json" "Retry-After" (str retry-after)}
-   :body (rpc/error nil -32029 (str "Rate limit exceeded — retry after " retry-after "s"))})
+   :body (rpc/error nil -32029 (str "Rate limit exceeded — retry after " retry-after "s"))}))
 
 ;; The optional body cap (`:max-body-bytes`). Absent = no cap, as before; a host
 ;; sets it when its other doors already have one. Over the cap is refused, never
@@ -168,6 +183,8 @@
 ;; Streamable HTTP (2025-03-26)
 ;; ---------------------------------------------------------------------------
 
+(def ^:private default-max-batch 50)
+
 (defn handle-get
   "GET /mcp — this server opens no server-initiated stream, so per the
    Streamable HTTP spec it answers 405 (a client then knows to POST here;
@@ -196,9 +213,19 @@
             ;; array of the responses (notifications contribute none). An empty
             ;; array is itself an Invalid Request per spec.
             (sequential? decoded)
-            (if (empty? decoded)
+            (cond
+              (empty? decoded)
               {:status 400 :headers {"Content-Type" "application/json"}
                :body (rpc/error nil -32600 "Invalid Request")}
+
+              ;; a batch passes the rate limit as one request: without a cap
+              ;; it is a way around the limit
+              (> (count decoded) (or (:max-batch deps) default-max-batch))
+              {:status 400 :headers {"Content-Type" "application/json"}
+               :body (rpc/error nil -32600 (str "A batch may hold at most "
+                                                (or (:max-batch deps) default-max-batch) " messages"))}
+
+              :else
               (let [responses (keep #(core/handle deps % ctx version) decoded)]
                 (if (seq responses)
                   {:status 200 :headers {"Content-Type" "application/json"}
@@ -229,7 +256,7 @@
 (defn handle-post
   "POST /mcp — the single endpoint for all JSON-RPC messages."
   [deps request]
-  (if (origin-mismatch? request) origin-forbidden (guarded deps #(handle-post* deps request))))
+  (if (origin-mismatch? deps request) origin-forbidden (guarded deps #(handle-post* deps request))))
 
 ;; ---------------------------------------------------------------------------
 ;; Legacy HTTP+SSE transport (2024-11-05) — compatibility layer
@@ -241,12 +268,24 @@
 ;; the stream. Same dispatch and auth as POST /mcp — only the framing differs.
 ;; ---------------------------------------------------------------------------
 
-(defonce ^:private sse-sessions
+(defonce ^:private shared-sessions
   ;; sid -> {:queue LinkedBlockingQueue :id str} — one entry per open stream,
   ;; removed when it closes. Only the caller's ID is held: /mcp/messages
   ;; carries its own Authorization header, so no credential ever needs to
   ;; outlive a request.
   (atom {}))
+
+(defn new-sessions
+  "A session table of an endpoint's own, for the `:sessions` dep: two endpoints
+   in one process then share neither sessions nor caps."
+  []
+  (atom {}))
+
+(defn- sse-sessions
+  "The endpoint's session table; the process-wide one for a host that calls
+   `handle-sse` / `handle-messages` with plain deps."
+  [deps]
+  (or (:sessions deps) shared-sessions))
 
 (def ^:private sse-max-sessions-per-id
   "Concurrency cap per caller. Each open stream parks a worker thread forever
@@ -270,26 +309,28 @@
 (defn- register-sse-session!
   "Atomically register a session, enforcing both caps inside the swap (no
    check-then-act race). Returns the sid, or nil when a cap is reached."
-  [id]
+  [deps id]
   (let [sid (str (UUID/randomUUID))
-        sessions (swap! sse-sessions
+        max-all (or (:sse-max-sessions deps) sse-max-sessions-global)
+        max-each (or (:sse-max-sessions-per-caller deps) sse-max-sessions-per-id)
+        sessions (swap! (sse-sessions deps)
                         (fn [sessions]
                           (cond
-                            (>= (count sessions) sse-max-sessions-global) sessions
+                            (>= (count sessions) max-all) sessions
                             (>= (count (filter #(= id (:id %)) (vals sessions)))
-                                sse-max-sessions-per-id) sessions
+                                max-each) sessions
                             :else (assoc sessions sid {:queue (LinkedBlockingQueue.)
                                                        :id id}))))]
     (when (contains? sessions sid) sid)))
 
-(defn- close-sse-session! [sid] (swap! sse-sessions dissoc sid))
+(defn- close-sse-session! [deps sid] (swap! (sse-sessions deps) dissoc sid))
 
 (defn- push-sse-response!
   "Queue a response onto the session's stream. true when the session exists AND
    this caller owns it; nil otherwise — the caller 404s, because an ownership
    failure is deliberately indistinguishable from an unknown session."
-  [sid id response]
-  (when-let [{:keys [queue] :as s} (get @sse-sessions sid)]
+  [deps sid id response]
+  (when-let [{:keys [queue] :as s} (get @(sse-sessions deps) sid)]
     (when (= id (:id s))
       (.offer ^LinkedBlockingQueue queue response)
       true)))
@@ -304,7 +345,7 @@
 (defn handle-sse
   "GET /mcp/sse — the old MCP transport's handshake + downstream channel."
   [deps request]
-  (if (origin-mismatch? request)
+  (if (origin-mismatch? deps request)
     origin-forbidden
     (guarded deps #(handle-sse* deps request))))
 
@@ -313,8 +354,8 @@
       (let [rl (allowed? deps id)]
         (if-not (:allowed? rl)
           (rate-limited (:retry-after-secs rl))
-          (if-let [sid (register-sse-session! id)]
-            (let [queue (:queue (get @sse-sessions sid))
+          (if-let [sid (register-sse-session! deps id)]
+            (let [queue (:queue (get @(sse-sessions deps) sid))
                   write-body (:sse-writer deps)]
               {:status 200
                :headers {"Content-Type" "text/event-stream"
@@ -325,7 +366,8 @@
                         (let [w (java.io.OutputStreamWriter. out "UTF-8")]
                           (try
                             ;; the handshake: where THIS session's messages go
-                            (.write w (str "event: endpoint\ndata: /mcp/messages?sessionId="
+                            (.write w (str "event: endpoint\ndata: " (or (:public-path deps) (:path deps) "/mcp")
+                                           "/messages?sessionId="
                                            sid "\n\n"))
                             (.flush w)
                             (loop []
@@ -336,7 +378,7 @@
                                 (do (.write w ": keepalive\n\n") (.flush w) (recur))))
                             (catch IOException _ nil) ; client went away — normal
                             (catch Exception _ nil)
-                            (finally (close-sse-session! sid))))))})
+                            (finally (close-sse-session! deps sid))))))})
             ;; Cap reached — refuse the open with the same 429 shape, so the
             ;; parked-thread exhaustion can't be opened past the cap.
             (rate-limited sse-cap-retry-after-secs))))
@@ -347,7 +389,7 @@
    the message, dispatch it, push the response onto the session's stream,
    answer 202. Unknown or foreign session → 404."
   [deps request]
-  (if (origin-mismatch? request)
+  (if (origin-mismatch? deps request)
     origin-forbidden
     (guarded deps #(handle-messages* deps request))))
 
@@ -357,7 +399,7 @@
         (if-not (:allowed? rl)
           (rate-limited (:retry-after-secs rl))
           (let [sid (query-param request "sessionId")]
-            (if-not (and sid (get @sse-sessions sid))
+            (if-not (and sid (get @(sse-sessions deps) sid))
               {:status 404 :headers {"Content-Type" "application/json"}
                :body (rpc/error nil -32002 "Unknown session — open GET /mcp/sse first")}
               (let [{:keys [text over]} (read-body deps request)
@@ -370,7 +412,7 @@
                    :body (rpc/error nil -32700 "Parse error")}
 
                   :else
-                  (let [session-version (get-in @sse-sessions [sid :protocol])
+                  (let [session-version (get-in @(sse-sessions deps) [sid :protocol])
                         version (or (core/supported-version (get-in request [:headers "mcp-protocol-version"])) session-version
                                     core/assumed-protocol-version)
                         response (core/handle deps decoded ctx version)]
@@ -378,13 +420,13 @@
                     ;; `initialize` settled, so later messages on it are read
                     ;; under that revision even without the header.
                     (when (and (map? decoded) (= "initialize" (:method decoded)))
-                      (swap! sse-sessions
+                      (swap! (sse-sessions deps)
                              (fn [m] (if (contains? m sid)
                                        (assoc-in m [sid :protocol]
                                                  (core/negotiate-protocol-version
                                                   (get-in decoded [:params :protocolVersion])))
                                        m))))
-                    (if (or (nil? response) (push-sse-response! sid id response))
+                    (if (or (nil? response) (push-sse-response! deps sid id response))
                       {:status 202 :body ""}
                       {:status 404 :headers {"Content-Type" "application/json"}
                        :body (rpc/error nil -32002
